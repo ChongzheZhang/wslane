@@ -105,6 +105,16 @@ class TuSimple(BaseDataset):
         img = cv2.imread(data_infos['img_path'])
         out_file = osp.join(self.cfg.work_dir, 'visualization', img_name.replace('/', '_'))
 
+        if self.seg_branch:
+            seg = predictions['seg_pred'][0].astype('int8')
+            seg = seg[:, :, np.newaxis]
+            zeros = np.zeros_like(seg)
+            mask_1 = np.concatenate((zeros, zeros, np.ma.array(seg, mask=(seg==1))*96), axis=2)
+            mask_2 = np.concatenate((zeros, np.ma.array(seg, mask=(seg==2))*48, zeros), axis=2)
+            mask_3 = np.concatenate((np.ma.array(seg, mask=(seg==3))*32, zeros, zeros), axis=2)
+            # mask_4 = np.concatenate((np.ma.array(seg, mask=(seg == 3)) * 24, np.ma.array(seg, mask=(seg == 3)) * 24, zeros), axis=2)
+            img = img + mask_1 + mask_2 + mask_3
+
         anno = data_infos['lanes']
         anno_array = [np.array(line) for line in anno]
         gt_lanes = []
@@ -138,16 +148,6 @@ class TuSimple(BaseDataset):
                                    tuple(next_p),
                                    color=color,
                                    thickness=3 if matches is None else 3)
-
-        if self.seg_branch:
-            seg = predictions['seg_pred'][0].astype('int8')
-            seg = seg[:, :, np.newaxis]
-            zeros = np.zeros_like(seg)
-            mask_1 = np.concatenate((zeros, zeros, np.ma.array(seg, mask=(seg==1))*96), axis=2)
-            mask_2 = np.concatenate((zeros, np.ma.array(seg, mask=(seg==2))*48, zeros), axis=2)
-            mask_3 = np.concatenate((np.ma.array(seg, mask=(seg==3))*32, zeros, zeros), axis=2)
-            # mask_4 = np.concatenate((np.ma.array(seg, mask=(seg == 3)) * 24, np.ma.array(seg, mask=(seg == 3)) * 24, zeros), axis=2)
-            img = img + mask_1 + mask_2 + mask_3
 
         if not osp.exists(osp.dirname(out_file)):
             os.makedirs(osp.dirname(out_file))
