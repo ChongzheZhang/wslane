@@ -103,11 +103,14 @@ def generate_json_file(save_dir, json_file, image_set):
 def generate_label(args):
     save_dir = os.path.join(args.root, args.savedir)
     os.makedirs(save_dir, exist_ok=True)
-    generate_json_file(save_dir, "train_val.json", TRAIN_VAL_SET)
+    generate_json_file(save_dir, "train.json", TRAIN_SET)
+    generate_json_file(save_dir, "val.json", VAL_SET)
     generate_json_file(save_dir, "test.json", TEST_SET)
 
-    print("generating train_val set...")
-    gen_label_for_json(args, 'train_val')
+    print("generating train set...")
+    gen_label_for_json(args, 'train')
+    print("generating val set...")
+    gen_label_for_json(args, 'val')
     print("generating test set...")
     gen_label_for_json(args, 'test')
 

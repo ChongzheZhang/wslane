@@ -83,9 +83,9 @@ install_requires = parse_requirements()
 def get_extensions():
     extensions = []
 
-    op_files = glob.glob('./clrnet/ops/csrc/*.c*')
+    op_files = glob.glob('./wslane/ops/csrc/*.c*')
     extension = CUDAExtension
-    ext_name = 'clrnet.ops.nms_impl'
+    ext_name = 'wslane.ops.nms_impl'
 
     ext_ops = extension(
         name=ext_name,
@@ -97,7 +97,7 @@ def get_extensions():
     return extensions
 
 
-setup(name='clrnet',
+setup(name='wslane',
       version="1.0",
       keywords='computer vision & lane detection',
       classifiers=[

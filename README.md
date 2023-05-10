@@ -42,8 +42,8 @@ git clone https://github.com/Turoad/clrnet
 ### Create a conda virtual environment and activate it (conda is optional)
 
 ```Shell
-conda create -n clrnet python=3.8 -y
-conda activate clrnet
+conda create -n wslane python=3.8 -y
+conda activate wslane
 ```
 
 ### Install dependencies
@@ -134,7 +134,7 @@ python main.py [configs/path_to_your_config] --gpus [gpu_num]
 
 For example, run
 ```Shell
-python main.py configs/clrnet/clr_resnet18_culane.py --gpus 0
+python main.py configs/wslane/clr_resnet18_culane.py --gpus 0
 ```
 
 ### Validation
@@ -145,7 +145,7 @@ python main.py [configs/path_to_your_config] --[test|validate] --load_from [path
 
 For example, run
 ```Shell
-python main.py configs/clrnet/clr_dla34_culane.py --validate --load_from culane_dla34.pth --gpus 0
+python main.py configs/wslane/clr_dla34_culane.py --validate --load_from culane_dla34.pth --gpus 0
 ```
 
 Currently, this code can output the visualization result when testing, just add `--view`.
