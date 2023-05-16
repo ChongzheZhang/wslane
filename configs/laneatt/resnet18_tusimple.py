@@ -20,40 +20,26 @@ heads = dict(type='LaneATT',
              anchors_freq_path=None,
              topk_anchors=1000)
 
-num_branch = True
-seg_branch = True
-ws_learn = True
-tri_loss = True
-
 train_parameters = dict(
     conf_threshold=None,
     nms_thres=15.,
     nms_topk=3000
 )
 test_parameters = dict(
-    conf_threshold=0.3,
+    conf_threshold=0.2,
     nms_thres=45,
     nms_topk=max_lanes
-)
-pseudo_label_parameters = dict(
-    conf_threshold=0.5,
-    nms_thres=45,
-    max_lanes=10,
-    nlane=5,
-    target_len=3.,
-    len_loss_weight=10,
 )
 
 optimizer = dict(
   type = 'Adam',
-  lr = 0.0001,
+  lr = 0.0015,
 )
 
-epochs = 1
+epochs = 100
 batch_size = 40
 total_iter = (3268 // batch_size + 1) * epochs
-# scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
-scheduler = dict(type='StepLR', step_size=10, gamma=0.99)
+scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
 
 eval_from = epochs - 1 # must smaller than epochs
 eval_ep = 1

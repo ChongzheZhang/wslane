@@ -20,27 +20,15 @@ heads = dict(type='LaneATT',
              anchors_freq_path=None,
              topk_anchors=1000)
 
-num_branch = True
-seg_branch = True
-ws_learn = True
-
 train_parameters = dict(
     conf_threshold=None,
-    nms_thres=50.,
+    nms_thres=15.,
     nms_topk=3000
 )
 test_parameters = dict(
     conf_threshold=0.5,
     nms_thres=50,
     nms_topk=max_lanes
-)
-pseudo_label_parameters = dict(
-    conf_threshold=0.5,
-    nms_thres=50,
-    max_lanes=10,
-    nlane=4,
-    target_len=3.,
-    len_loss_weight=10,
 )
 
 optimizer = dict(
