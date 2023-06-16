@@ -29,9 +29,16 @@ class Detector(nn.Module):
     def get_mask(self, output):
         with torch.no_grad():
             softmax = nn.Softmax(dim=1)
-            batch_seg = nn.functional.interpolate(output['seg'], size=(self.cfg.ori_img_h, self.cfg.ori_img_w), mode='bilinear')
+            height = self.cfg.ori_img_h - self.cfg.cut_height
+            batch_seg = nn.functional.interpolate(output['seg'], size=(height, self.cfg.ori_img_w), mode='bilinear',
+                                                  align_corners=False)
             batch_seg = softmax(batch_seg)
             batch_seg = torch.max(batch_seg, dim=1)[1]
+            if self.cfg.cut_height != 0:
+                zeros_padding = torch.zeros(batch_seg.shape[0], self.cfg.cut_height, batch_seg.shape[2],
+                                            dtype=torch.int64, device=batch_seg.device)
+                batch_seg = torch.cat((zeros_padding, batch_seg), dim=1)
+
         return batch_seg
 
 

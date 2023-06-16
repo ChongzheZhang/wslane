@@ -13,47 +13,53 @@ featuremap_out_channel = 512
 featuremap_out_stride = 32 
 
 num_points = 72
-max_lanes = 4
+max_lanes = 5
 sample_y = range(589, 230, -1)
 
 heads = dict(type='LaneATT',
              anchors_freq_path=None,
              topk_anchors=1000)
 
-num_branch = True
-seg_branch = False
 ws_learn = True
+ws_combine_learn = True
+num_branch = False
+seg_branch = True
 tri_loss = False
 det_to_seg = False
+seg_proportion_to_num = False
 
 train_parameters = dict(
     conf_threshold=None,
-    nms_thres=15.,
+    nms_thres=45.,
     nms_topk=3000
 )
 test_parameters = dict(
-    conf_threshold=0.5,
-    nms_thres=50,
+    conf_threshold=0.2,
+    nms_thres=45,
     nms_topk=max_lanes
 )
 pseudo_label_parameters = dict(
     conf_threshold=0.5,
-    nms_thres=50,
+    nms_thres=45,
     max_lanes=10,
     nlane=4,
+)
+rectify_parameters = dict(
+    upper_thr = 0.5,
+    lower_thr = 0.1,
 )
 
 optimizer = dict(
   type = 'AdamW',
-  lr = 0.0001,
+  lr = 1e-4,
 )
 
 epochs = 1
 batch_size = 40
 total_iter = (88880 // batch_size) * epochs
-scheduler = dict(type='StepLR', step_size=10, gamma=0.99)
+scheduler = dict(type='CosineAnnealingLR', T_max=total_iter)
 
-eval_from = epochs - 1 # must smaller than epochs
+eval_from = 0 # must smaller than epochs
 eval_ep = 1
 
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1., 1., 1.])
@@ -97,6 +103,8 @@ val_process = [
 
 dataset_path = './data/CULane'
 dataset_type = 'CULane'
+source_dataset_path = './data/tusimple'
+source_dataset_type = 'TuSimple'
 dataset = dict(
     train=dict(
         type=dataset_type,
@@ -122,6 +130,14 @@ dataset = dict(
         split='debug',
         processes=val_process,
     ),
+    source=dict(
+        type=source_dataset_type,
+        data_root=source_dataset_path,
+        split='train',
+        processes=train_process,
+        data_size=88880,
+        repeat_factor=(88880//3268 + 1),
+    )
 )
 
 
@@ -130,3 +146,10 @@ log_interval = 1
 seed=0
 lr_update_by_epoch = False
 num_classes = 4
+seg_weight = [0.5, 1.0, 1.0, 1.5]
+
+cls_loss_weight = 1.0
+reg_loss_weight = 1.0
+num_lane_loss_weight = 1.0
+tri_loss_weight = 1.0
+seg_prop_weight = 0.01

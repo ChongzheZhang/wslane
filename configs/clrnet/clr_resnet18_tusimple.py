@@ -18,6 +18,8 @@ heads = dict(type='CLRHead',
              fc_hidden_dim=64,
              sample_points=36)
 
+seg_branch = True
+
 iou_loss_weight = 2.
 cls_loss_weight = 6.
 xyt_loss_weight = 0.5
@@ -34,13 +36,14 @@ neck = dict(type='FPN',
 test_parameters = dict(conf_threshold=0.40, nms_thres=50, nms_topk=max_lanes)
 
 epochs = 70
-batch_size = 40
+batch_size = 120
 
-optimizer = dict(type='AdamW', lr=1.0e-3)  # 3e-4 for batchsize 8
-total_iter = (3616 // batch_size + 1) * epochs
+optimizer = dict(type='AdamW', lr=3.0e-3)  # 3e-4 for batchsize 8
+total_iter = (3268 // batch_size + 1) * epochs
 scheduler = dict(type='CosineAnnealingLR', T_max=total_iter)
 
-eval_ep = 3
+eval_from = epochs - 20
+eval_ep = 5
 
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1., 1., 1.])
 ori_img_w = 1280
@@ -101,13 +104,13 @@ test_json_file = 'data/tusimple/test_label.json'
 dataset = dict(train=dict(
     type=dataset_type,
     data_root=dataset_path,
-    split='trainval',
+    split='train',
     processes=train_process,
 ),
 val=dict(
     type=dataset_type,
     data_root=dataset_path,
-    split='test',
+    split='val',
     processes=val_process,
 ),
 test=dict(
@@ -118,9 +121,10 @@ test=dict(
 ))
 
 workers = 10
-log_interval = 100
+log_interval = 1
 # seed = 0
-num_classes = 6 + 1
+num_classes = 4
+seg_weight = [0.4, 1.0, 1.0, 1.0]
 ignore_label = 255
-bg_weight = 0.4
+# bg_weight = 0.4
 lr_update_by_epoch = False

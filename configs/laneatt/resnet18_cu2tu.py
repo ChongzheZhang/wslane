@@ -20,11 +20,14 @@ heads = dict(type='LaneATT',
              anchors_freq_path=None,
              topk_anchors=1000)
 
-num_branch = True
-seg_branch = True
 ws_learn = True
+ws_combine_learn = False
+num_branch = False
+seg_branch = True
 tri_loss = True
-det_to_seg = True
+pycda = False
+det_to_seg = False
+seg_proportion_to_num = False
 
 train_parameters = dict(
     conf_threshold=None,
@@ -42,18 +45,23 @@ pseudo_label_parameters = dict(
     max_lanes=10,
     nlane=5,
 )
+rectify_parameters = dict(
+    upper_thr = 0.8,
+    lower_thr = 0.3,
+)
 
 optimizer = dict(
   type = 'Adam',
-  lr = 0.0001,
+  lr = 1e-4,
 )
 
 epochs = 1
 batch_size = 40
 total_iter = (3268 // batch_size + 1) * epochs
 scheduler = dict(type='StepLR', step_size=10, gamma=0.99)
+# scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
 
-eval_from = epochs - 1 # must smaller than epochs
+eval_from = 0 # must smaller than epochs
 eval_ep = 1
 
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1., 1., 1.])
@@ -98,12 +106,15 @@ val_process = [
 dataset_path = './data/tusimple'
 test_json_file = 'data/tusimple/test_label.json'
 dataset_type = 'TuSimple'
+source_dataset_path = './data/CULane'
+source_dataset_type = 'CULane'
 dataset = dict(
     train=dict(
         type=dataset_type,
         data_root=dataset_path,
         split='train',
         processes=train_process,
+        # repeat_factor=3,
     ),
     val=dict(
         type=dataset_type,
@@ -123,6 +134,13 @@ dataset = dict(
         split='debug',
         processes=val_process,
     ),
+    # source=dict(
+    #     type=source_dataset_type,
+    #     data_root=source_dataset_path,
+    #     split='train',
+    #     processes=train_process,
+    #     data_size=3268 * 3,
+    # )
 )
 
 
@@ -131,3 +149,11 @@ log_interval = 1
 seed=0
 lr_update_by_epoch = False
 num_classes = 4
+seg_weight = [0.5, 1.0, 1.0, 1.5]
+
+cls_loss_weight = 1.0
+reg_loss_weight = 1.0
+num_lane_loss_weight = 1.0
+seg_loss_weight = 1.0
+tri_loss_weight = 1.5
+seg_prop_weight = 0.1

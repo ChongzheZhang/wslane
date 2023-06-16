@@ -24,13 +24,17 @@ PRED_MISS_COLOR = (0, 0, 255)
 
 @DATASETS.register_module
 class TuSimple(BaseDataset):
-    def __init__(self, data_root, split, processes=None, cfg=None):
+    def __init__(self, data_root, split, processes=None, data_size=None, repeat_factor=1, cfg=None):
         super().__init__(data_root, split, processes, cfg)
         self.anno_files = SPLIT_FILES[split]
+        self.data_size = data_size
+        self.repeat_factor = repeat_factor
         self.load_annotations()
         self.num_branch = cfg.num_branch if 'num_branch' in cfg else False
         self.seg_branch = cfg.seg_branch if 'seg_branch' in cfg else False
         self.h_samples = list(range(160, 720, 10))
+        self.ori_img_w = 1280
+        self.ori_img_h = 720
 
     def load_annotations(self):
         self.logger.info('Loading TuSimple annotations...')
@@ -40,6 +44,7 @@ class TuSimple(BaseDataset):
             anno_file = osp.join(self.data_root, anno_file)
             with open(anno_file, 'r') as anno_obj:
                 lines = anno_obj.readlines()
+                lines = lines * self.repeat_factor
             for line in lines:
                 data = json.loads(line)
                 y_samples = data['h_samples']
@@ -57,6 +62,8 @@ class TuSimple(BaseDataset):
 
         if self.training:
             random.shuffle(self.data_infos)
+        if self.data_size is not None:
+            self.data_infos = self.data_infos[:self.data_size]
         self.max_lanes = max_lanes
 
     def pred2lanes(self, pred):
@@ -112,7 +119,7 @@ class TuSimple(BaseDataset):
             mask_1 = np.concatenate((zeros, zeros, np.ma.array(seg, mask=(seg==1))*96), axis=2)
             mask_2 = np.concatenate((zeros, np.ma.array(seg, mask=(seg==2))*48, zeros), axis=2)
             mask_3 = np.concatenate((np.ma.array(seg, mask=(seg==3))*32, zeros, zeros), axis=2)
-            # mask_4 = np.concatenate((np.ma.array(seg, mask=(seg == 3)) * 24, np.ma.array(seg, mask=(seg == 3)) * 24, zeros), axis=2)
+            # mask_4 = np.concatenate((np.ma.array(seg, mask=(seg == 4)) * 32, np.ma.array(seg, mask=(seg == 4)) * 32, zeros), axis=2)
             img = img + mask_1 + mask_2 + mask_3
 
         anno = data_infos['lanes']

@@ -34,6 +34,8 @@ class LaneATT(nn.Module):
         self.stride = cfg.featuremap_out_stride
         self.img_w = img_w
         self.img_h = img_h
+        self.ori_img_w = cfg.ori_img_w
+        self.ori_img_h = cfg.ori_img_h
         self.n_strips = S - 1
         self.n_offsets = S
         self.fmap_h = img_h // self.stride
@@ -46,6 +48,9 @@ class LaneATT(nn.Module):
         self.seg_branch = cfg.seg_branch if 'seg_branch' in cfg else False
         self.ws_learn = self.cfg.ws_learn if 'ws_learn' in cfg else False
         self.tri_loss = self.cfg.tri_loss if 'tri_loss' in cfg else False
+        self.det_to_seg = self.cfg.det_to_seg if 'det_to_seg' in cfg else False
+        self.seg_proportion_to_num = self.cfg.seg_proportion_to_num if 'seg_proportion_to_num' in cfg else False
+        self.pycda = self.cfg.pycda if 'pycda' in cfg else False
 
         # Anchor angles, same ones used in Line-CNN
         self.left_angles = [72., 60., 49., 39., 30., 22.]
@@ -76,6 +81,9 @@ class LaneATT(nn.Module):
         self.initialize_layer(self.conv1)
         self.initialize_layer(self.cls_layer)
         self.initialize_layer(self.reg_layer)
+        if self.tri_loss:
+            self.tri_layer = nn.Linear(self.anchor_feat_channels * self.fmap_h, 16)
+            self.initialize_layer(self.tri_layer)
         if self.num_branch:
             self.nlane = self.cfg.pseudo_label_parameters.nlane + 1
             inter_channels = backbone_nb_channels // 4
@@ -88,6 +96,11 @@ class LaneATT(nn.Module):
             )
             for layer in self.num_branch_layers:
                 self.initialize_layer(layer)
+        if self.seg_proportion_to_num:
+            previous_seg_label_ave = nn.Parameter(torch.zeros(1, 3, dtype=torch.float32), requires_grad=False)
+            self.register_parameter(name='previous_seg_label_ave', param=previous_seg_label_ave)
+            previous_number_of_lane_sum = nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+            self.register_parameter(name='previous_number_of_lane_sum', param=previous_number_of_lane_sum)
 
         # self.inited = False
 
@@ -106,7 +119,12 @@ class LaneATT(nn.Module):
             self.initialize_layer(self.seg_conv2)
             self.initialize_layer(self.seg_conv3)
             self.seg_decoder = SegDecoder(self.img_h, self.img_w, self.cfg.num_classes)
+
     def forward(self, x, **kwargs):
+        if self.training:
+            self.is_target = kwargs['batch']['is_target'] if 'is_target' in kwargs['batch'] else False
+        else:
+            self.is_target = True
         output = {}
         param = self.cfg.train_parameters if self.training else self.cfg.test_parameters
         conf_threshold = param.conf_threshold
@@ -117,7 +135,7 @@ class LaneATT(nn.Module):
         x = x[-1]
         batch_features = self.conv1(x)
         batch_anchor_features = self.cut_anchor_features(batch_features)
-        if self.num_branch:
+        if self.num_branch and self.is_target:
             batch_num_lane = self.num_forward(x)
             output['batch_num_lane'] = batch_num_lane
 
@@ -134,6 +152,26 @@ class LaneATT(nn.Module):
                 dim=1)
             seg = self.seg_decoder(seg_features)
             output['seg'] = seg
+            if self.pycda:
+                avgpl_1 = nn.AvgPool2d((2, 2))
+                avgpl_2 = nn.AvgPool2d((4, 4))
+                seg_pool_1 = avgpl_1(seg)
+                seg_pool_2 = avgpl_2(seg)
+                output['seg_pool_1'] = seg_pool_1
+                output['seg_pool_2'] = seg_pool_2
+
+            if self.seg_proportion_to_num:
+                seg_scores_ = F.softmax(seg, dim=1)[:, 1:, :, :]
+                mask = seg_scores_ > 0.5
+                seg_to_subtract = seg_scores_.clone()
+                seg_to_subtract[mask] = 0
+                seg_scores = seg_scores_ - seg_to_subtract
+                label1_sum = torch.sum(seg_scores[:, 0, :, :], dim=(2, 1)) / self.img_h
+                label2_sum = torch.sum(seg_scores[:, 1, :, :], dim=(2, 1)) / self.img_h
+                label3_sum = torch.sum(seg_scores[:, 2, :, :], dim=(2, 1)) / self.img_h
+
+                current_seg_label_sum = torch.cat((label1_sum.view(-1,1), label2_sum.view(-1,1), label3_sum.view(-1,1)), dim=1)
+                output['current_seg_label_sum'] = current_seg_label_sum
 
 
         # Join proposals from all images into a single proposals features batch
@@ -152,11 +190,11 @@ class LaneATT(nn.Module):
                                        torch.transpose(attention_matrix, 1, 2)).transpose(1, 2)
         attention_features = attention_features.reshape(-1, self.anchor_feat_channels * self.fmap_h)
         batch_anchor_features = batch_anchor_features.reshape(-1, self.anchor_feat_channels * self.fmap_h)
-        batch_anchor_features = torch.cat((attention_features, batch_anchor_features), dim=1)
+        batch_anchor_features_all = torch.cat((attention_features, batch_anchor_features), dim=1)
 
         # Predict
-        cls_logits = self.cls_layer(batch_anchor_features)
-        reg = self.reg_layer(batch_anchor_features)
+        cls_logits = self.cls_layer(batch_anchor_features_all)
+        reg = self.reg_layer(batch_anchor_features_all)
 
         # Undo joining
         cls_logits = cls_logits.reshape(x.shape[0], -1, cls_logits.shape[1])
@@ -173,8 +211,8 @@ class LaneATT(nn.Module):
 
         # Rectify
         if self.training == False:
-            if self.seg_branch:
-                segmentations = nn.functional.interpolate(output['seg'], size=(self.cfg.ori_img_h, self.cfg.ori_img_w), mode='bilinear')
+            if self.seg_branch and self.ws_learn:
+                segmentations = nn.functional.interpolate(output['seg'], size=(self.ori_img_h, self.ori_img_w), mode='bilinear', align_corners=False)
                 for idx, ((proposals, anchors, _, _), segmentation) in enumerate(zip(proposals_list, segmentations)):
                     new_scores = self.score_rectified_by_seg(proposals, segmentation)
                     mask = new_scores > conf_threshold
@@ -186,8 +224,12 @@ class LaneATT(nn.Module):
 
 
         if self.training:
-            if self.ws_learn:
-                meta_batch = self.generate_pseudo_label(output, kwargs['batch'])
+            if self.ws_learn and self.is_target:
+                batch_anchor_features_tri = None
+                if self.tri_loss:
+                    batch_anchor_features_tri = self.tri_layer(batch_anchor_features)
+                    batch_anchor_features_tri = batch_anchor_features_tri.reshape(x.shape[0], len(self.anchors), -1)
+                meta_batch = self.generate_pseudo_label(output, kwargs['batch'], batch_anchor_features_tri)
             else:
                 meta_batch = kwargs['batch']
             loss_dic = {}
@@ -295,14 +337,23 @@ class LaneATT(nn.Module):
 
     def loss(self, output, meta_batch, loss_dic):
         loss_dic = self.detection_branch_loss(output, meta_batch, loss_dic)
-        if self.num_branch:
-            loss_dic = self.num_branch_loss(output, meta_batch, loss_dic)
         if self.seg_branch:
             loss_dic = self.seg_branch_loss(output, meta_batch, loss_dic)
+        if self.num_branch and self.is_target:
+            loss_dic = self.num_branch_loss(output, meta_batch, loss_dic)
 
         return loss_dic
 
-    def detection_branch_loss(self, output, meta_batch, loss_dic, cls_loss_weight=1):
+    def detection_branch_loss(self, output, meta_batch, loss_dic,
+                              cls_loss_weight=10,
+                              reg_loss_weight=1,
+                              num_lane_loss_weight=1.0):
+        if self.cfg.haskey('cls_loss_weight'):
+            cls_loss_weight = self.cfg.cls_loss_weight
+        if self.cfg.haskey('reg_loss_weight'):
+            reg_loss_weight = self.cfg.reg_loss_weight
+        if self.cfg.haskey('num_lane_loss_weight'):
+            num_lane_loss_weight = self.cfg.num_lane_loss_weight
         loss_dic['loss'] = 0
         loss_dic['loss_stats'] = {}
 
@@ -367,32 +418,55 @@ class LaneATT(nn.Module):
                 invalid_offsets_mask[:, 0] = False
                 reg_target = target[:, 4:]
                 reg_target[invalid_offsets_mask] = reg_pred[invalid_offsets_mask]
+                if self.ws_learn:
+                    invalid = reg_target < 0
+                    if torch.any(invalid):
+                        reg_target[invalid] = reg_pred[invalid]
 
             # Loss calc
             reg_loss += smooth_l1_loss(reg_pred, reg_target)
             cls_loss += focal_loss(cls_pred, cls_target).sum() / num_positives
 
-            # triplet loss
-            if self.tri_loss:
-                negative_target = meta_batch['negative_target']
-                while negative_target.shape[0] < reg_target.shape[0]:
-                    negative_target = torch.cat([negative_target, negative_target], dim=0)
-                negative_target = negative_target[:reg_target.shape[0], 5:] / self.img_w
-                tri_reg_pred = reg_pred[:, 1:] / self.img_w
-                tri_reg_target = reg_target[:, 1:] / self.img_w
-                tri_loss += triplet_loss(tri_reg_pred, tri_reg_target, negative_target) * 50.
+        # triplet loss
+        if self.tri_loss and self.is_target:
+            non_zero_counter = 0
+            tri_loss_weight = self.cfg.tri_loss_weight if self.cfg.haskey('tri_loss_weight') else 1.0
+            for positive_target, negative_target in zip(meta_batch['positive_target'], meta_batch['negative_target']):
+                device = positive_target.device
+                positive_len = positive_target.shape[0]
+                negative_len = negative_target.shape[0]
+                tri_sample_len = min(positive_len, negative_len)
+                positive_target = positive_target[:tri_sample_len, :]
+                negative_target = negative_target[:tri_sample_len, :]
+                if tri_sample_len != 0:
+                    non_zero_counter += 1
+                    if tri_sample_len <= 2:
+                        tri_anchor = positive_target.clone()
+                        positive_target = positive_target.flip(dims=[0])
+                    else:
+                        tri_anchor = positive_target.repeat_interleave(tri_sample_len-1, dim=0)
+                        positive_target = positive_target.repeat(tri_sample_len, 1)
+                        masked_number = torch.arange(tri_sample_len, dtype=torch.long, device=device) * (tri_sample_len + 1)
+                        mask = torch.ones(positive_target.shape[0], dtype=torch.bool, device=device)
+                        mask[masked_number] = False
+                        positive_target = positive_target[mask]
+                        negative_target = negative_target[:tri_sample_len-1, ...].repeat(tri_sample_len, 1)
+                    tri_loss += triplet_loss(tri_anchor, positive_target, negative_target) * tri_loss_weight
+            tri_loss /= (non_zero_counter + 1e-3)
 
 
         # Batch mean
         cls_loss /= valid_imgs
         reg_loss /= valid_imgs
-        tri_loss /= valid_imgs
 
-        loss = cls_loss_weight * cls_loss + reg_loss + tri_loss
+        if 'average_pseudo_number_of_lane' in meta_batch:
+            loss_dic['loss_stats']['ave_pseudo_lane'] = meta_batch['average_pseudo_number_of_lane']
+
+        loss = cls_loss_weight * cls_loss + reg_loss_weight * reg_loss + tri_loss
         loss_dic['loss'] = loss
         loss_dic['loss_stats']['loss'] = loss_dic['loss']
-        loss_dic['loss_stats']['cls_loss'] = cls_loss
-        loss_dic['loss_stats']['reg_loss'] = reg_loss
+        loss_dic['loss_stats']['cls_loss'] = cls_loss_weight * cls_loss
+        loss_dic['loss_stats']['reg_loss'] = reg_loss_weight * reg_loss
         if tri_loss:
             loss_dic['loss_stats']['tri_loss'] = tri_loss
         loss_dic['loss_stats']['batch_positives'] = total_positives
@@ -401,14 +475,13 @@ class LaneATT(nn.Module):
             positive_pseudo_label_len = meta_batch['positive_pseudo_label_len']
             number_gt = meta_batch['number'].view(-1, 1)
             mse_loss = nn.MSELoss()
-            number_lane_loss = mse_loss(positive_pseudo_label_len, number_gt.to(dtype=torch.float32))
+            number_lane_loss = mse_loss(positive_pseudo_label_len, number_gt.to(dtype=torch.float32)) * num_lane_loss_weight
 
             loss_dic['loss'] += number_lane_loss
             loss_dic['loss_stats']['loss'] = loss_dic['loss']
             loss_dic['loss_stats']['number_lane_loss'] = number_lane_loss
 
-
-        return  loss_dic
+        return loss_dic
 
     def num_branch_loss(self, output, meta_batch, loss_dic):
         targets = meta_batch['number']
@@ -421,7 +494,8 @@ class LaneATT(nn.Module):
 
         return loss_dic
 
-    def seg_branch_loss(self, output, meta_batch, loss_dic, seg_loss_weight=1):
+    def seg_branch_loss(self, output, meta_batch, loss_dic):
+        seg_loss_weight = self.cfg.seg_loss_weight if self.cfg.haskey('seg_loss_weight') else 1.0
         targets = meta_batch['seg']
         # predictions = output['seg']
         # ce_loss = nn.CrossEntropyLoss(weight=torch.tensor([0.5, 1.0, 1.5, 2.0]).to(device=predictions.device))
@@ -429,94 +503,181 @@ class LaneATT(nn.Module):
 
         # nllloss version
         predictions = F.log_softmax(output['seg'], dim=1)
-        nllloss = nn.NLLLoss(weight=torch.tensor([0.5, 1.0, 1.5, 2.0]).to(device=predictions.device))
+        weights = torch.FloatTensor(self.cfg.seg_weight).to(device=predictions.device)
+        nllloss = nn.NLLLoss(weight=weights)
         seg_loss = nllloss(predictions, targets.long()) * seg_loss_weight
-        loss_dic['loss'] += seg_loss
-        loss_dic['loss_stats']['loss'] = loss_dic['loss']
-        loss_dic['loss_stats']['seg_loss'] = seg_loss
+        loss_dic = self.updata_loss_dic(seg_loss, 'seg_loss', loss_dic)
+
+        if self.seg_proportion_to_num:
+            seg_prop_weight = self.cfg.seg_prop_weight if 'seg_prop_weight' in self.cfg else 1.0
+            batch_size = meta_batch['number'].shape[0]
+            mse_loss = nn.MSELoss()
+            current_num_sum = torch.sum(meta_batch['number'])
+            current_seg_label_sum = output['current_seg_label_sum']
+            seg_label_sum_target = self.previous_seg_label_ave.repeat(batch_size, 1)
+            for i, number in enumerate(meta_batch['number']):
+                seg_label_sum_target[i, :] *= number
+            seg_proportion_loss = mse_loss(current_seg_label_sum, seg_label_sum_target) * seg_prop_weight
+            loss_dic = self.updata_loss_dic(seg_proportion_loss, 'seg_proportion_loss', loss_dic)
+
+            current_seg_label_batch_sum = torch.sum(current_seg_label_sum, dim=0, keepdim=True)
+            previous_seg_label_ave = nn.Parameter((self.previous_seg_label_ave * self.previous_number_of_lane_sum + current_seg_label_batch_sum.detach()) / (
+                    self.previous_number_of_lane_sum + current_num_sum),
+                                                  requires_grad=False)
+            self.previous_seg_label_ave = previous_seg_label_ave
+            self.previous_number_of_lane_sum += current_num_sum
+
+        if self.pycda and self.is_target:
+            seg_pool_1_target = meta_batch['seg_pool_1_label']
+            seg_pool_2_target = meta_batch['seg_pool_2_label']
+            seg_pool_1_pred = F.log_softmax(output['seg_pool_1'], dim=1)
+            seg_pool_2_pred = F.log_softmax(output['seg_pool_2'], dim=1)
+            seg_pool_1_loss = nllloss(seg_pool_1_pred, seg_pool_1_target) * seg_loss_weight
+            seg_pool_2_loss = nllloss(seg_pool_2_pred, seg_pool_2_target) * seg_loss_weight
+            loss_dic = self.updata_loss_dic(seg_pool_1_loss, 'seg_pool_1_loss', loss_dic)
+            loss_dic = self.updata_loss_dic(seg_pool_2_loss, 'seg_pool_2_loss', loss_dic)
 
         return loss_dic
 
-    def generate_pseudo_label(self, prediction_batch, meta_batch):
+    def updata_loss_dic(self, loss, loss_name, loss_dic):
+        loss_dic['loss'] += loss
+        loss_dic['loss_stats']['loss'] = loss_dic['loss']
+        loss_dic['loss_stats'][f'{loss_name}'] = loss
+        return loss_dic
+
+    def generate_pseudo_label(self, prediction_batch, meta_batch, batch_anchor_features_tri=None):
         softmax = nn.Softmax(dim=1)
         param = self.cfg.pseudo_label_parameters
         conf_threshold = param.conf_threshold
         max_lanes = param.max_lanes
         predictions = prediction_batch['proposals_list']
-        segmentations = nn.functional.interpolate(prediction_batch['seg'], size=(self.cfg.ori_img_h, self.cfg.ori_img_w), mode='bilinear')
+        segmentations = nn.functional.interpolate(prediction_batch['seg'], size=(self.ori_img_h, self.ori_img_w), mode='bilinear', align_corners=False)
+        positive_coordinate_batch = []
 
-        p_len = predictions[0][0].shape[1]
-        max_lane = max([t[0].shape[0] for t in predictions])
-        pseudo_label = torch.ones((meta_batch['img'].shape[0], max_lane, p_len), dtype=torch.float32, device=predictions[0][0].device) * -1e5
-        positive_pseudo_label_len = torch.zeros((meta_batch['img'].shape[0], 1), device=predictions[0][0].device)
+        anchor_len = predictions[0][0].shape[1]
+        device = meta_batch['img'].device
+        batch_size = meta_batch['img'].shape[0]
+        pseudo_label = torch.ones((batch_size, max_lanes, anchor_len), dtype=torch.float32, device=device) * -1e5
+        positive_pseudo_label_len = torch.zeros((batch_size, 1), device=device)
         pseudo_label[:, :, 0] = 1
         pseudo_label[:, :, 1] = 0
-        n_lane = 0
-        for i, ((proposals, _, _, _), segmentation) in enumerate(zip(predictions, segmentations)):
-            if self.tri_loss:
-                new_proposals = proposals[:30, :].detach().clone()
+        max_lane = 0
+        pseudo_number_of_lane = 0
+        meta_batch['negative_target'] = []
+        meta_batch['positive_target'] = []
+        for i, ((proposals, _, _, anchor_feature_idx), segmentation) in enumerate(zip(predictions, segmentations)):
+            if self.tri_loss or self.det_to_seg:
+                if not self.seg_branch:
+                    raise ValueError("Triplet Loss or Detection Results to Segmetation Label must have Segmentation branch")
+
+                new_proposals = proposals[:30, :].clone()
+                new_anchor_feature_idx = anchor_feature_idx[:30].clone()
                 new_scores = self.score_rectified_by_seg(new_proposals, segmentation)
-                _, negative_indice = torch.sort(new_scores)
-                negative_target = new_proposals[negative_indice, :]
-                meta_batch['negative_target'] = negative_target[:20, :]
 
-            scores = softmax(proposals[:, :2])[:, 1]
-            mask = scores > conf_threshold
-            proposals = proposals[mask]
-            pre_length = proposals[:, 2] * self.n_strips + proposals[:, 4]
-            valid_length = pre_length < self.n_strips
-            proposals = proposals[valid_length]
-            finial_scores = softmax(proposals[:, :2])[:, 1]
-            positive_pseudo_label_len[i, 0] = finial_scores.sum()
+                if self.tri_loss:
+                    anchor_features_tri = batch_anchor_features_tri[i, ...]
+                    _, negative_indices = torch.sort(new_scores)
+                    negative_indices = negative_indices[:10]
+                    new_anchor_feature_idx = new_anchor_feature_idx[negative_indices]
+                    negative_anchor_features = anchor_features_tri[new_anchor_feature_idx]
+                    meta_batch['negative_target'].append(negative_anchor_features)
 
+                if self.det_to_seg:
+                    with torch.no_grad():
+                        positive_proposals = new_proposals[new_scores > self.cfg.rectify_parameters.upper_thr]
+                        number_lane_gt = meta_batch['number'][i]
+                        if positive_proposals.shape[0] > number_lane_gt:
+                            positive_proposals = positive_proposals[:number_lane_gt, :]
+                        positive_coordinate = []
+                        if positive_proposals.shape[0] != 0:
+                            positive_coordinate = self.get_anchor_coordinate(positive_proposals)
+                        positive_coordinate_batch.append(positive_coordinate)
 
             with torch.no_grad():
-                proposals_copy = proposals.clone()
-                proposals_copy[:, 0] = 0
-                proposals_copy[:, 1] = 1
-                proposals_copy[:, 2:4] = torch.maximum(proposals_copy[:, 2:4], torch.zeros_like(proposals_copy[:, 2:4]))
-                proposals_copy[:, 2:4] = torch.minimum(proposals_copy[:, 2:4], torch.ones_like(proposals_copy[:, 2:4]))
-                proposals_copy[:, 3] = proposals_copy[:, 3] * self.img_w
-                proposals_copy[:, 4] = torch.round(proposals_copy[:, 4])
-                all_lane_length = torch.round(proposals_copy[:, 2] * self.n_strips) + proposals_copy[:, 4]
-                for k, lane_length in enumerate(all_lane_length.to(torch.int)):
-                    proposals_copy[k, 5 + lane_length.item():] = -1e5
+                lane_num_to_keep = torch.arange(proposals.shape[0], dtype=torch.int64, device=device)
+                scores = softmax(proposals[:, :2])[:, 1]
+                mask = scores > conf_threshold
+                proposals = proposals[mask]
+                lane_num_to_keep = lane_num_to_keep[mask]
 
-                this_lane = proposals_copy.shape[0]
-                pseudo_label[i, :this_lane, :] = proposals_copy
-                if this_lane > n_lane:
-                    n_lane = this_lane
+                pre_length = proposals[:, 2] * self.n_strips + proposals[:, 4]
+                valid_length = pre_length < self.n_strips
+                proposals = proposals[valid_length]
+                lane_num_to_keep = lane_num_to_keep[valid_length]
 
-        print(f"n_lane: {n_lane}")
-        n_lane = max([n_lane, 4])
-        if n_lane > max_lanes:
-            n_lane = max_lanes
-        pseudo_label = pseudo_label[:, :n_lane, :]
+                if proposals.shape[0] > 0:
+                    proposals[:, 0] = 0
+                    proposals[:, 1] = 1
+                    proposals[:, 2:4] = torch.clamp(proposals[:, 2:4], min=0, max=1)
+                    proposals[:, 3] = proposals[:, 3] * self.img_w
+                    proposals[:, 4] = torch.round(proposals[:, 4])
+                    all_lane_length = torch.round(proposals[:, 2] * self.n_strips) + proposals[:, 4]
+                    for k, lane_length in enumerate(all_lane_length.to(torch.int)):
+                        proposals[k, 5 + lane_length.item():] = -1e5
+
+                    these_lanes = min(proposals.shape[0], max_lanes)
+                    pseudo_label[i, :these_lanes, :] = proposals[:these_lanes, :]
+                    pseudo_number_of_lane += these_lanes
+                    if these_lanes > max_lane:
+                        max_lane = these_lanes
+
+            lane_num_proposals = predictions[i][0][lane_num_to_keep, :2]
+            if lane_num_proposals.shape[0] > 0:
+                num_scores = softmax(lane_num_proposals)[:, 1]
+                positive_pseudo_label_len[i, 0] = num_scores.sum()
+            if self.tri_loss:
+                not_equal_mask = torch.all(lane_num_to_keep.unsqueeze(1) != negative_indices.unsqueeze(0), dim=1)
+                lane_num_to_keep_in_tri = lane_num_to_keep[not_equal_mask]
+                positive_anchor_features_idx = anchor_feature_idx[lane_num_to_keep_in_tri]
+                positive_anchor_features = anchor_features_tri[positive_anchor_features_idx]
+                meta_batch['positive_target'].append(positive_anchor_features)
+
+        pseudo_number_of_lane /= batch_size
+        max_lane = max(max_lane, 4)
+        pseudo_label = pseudo_label[:, :max_lane, :]
 
         meta_batch['lane_line'] = pseudo_label
         meta_batch['positive_pseudo_label_len'] = positive_pseudo_label_len
+        meta_batch['average_pseudo_number_of_lane'] = torch.tensor(pseudo_number_of_lane)
 
         if self.seg_branch:
+            def seg_pred_to_label(preds):
+                softmax = nn.Softmax(dim=1)
+                all_seg_scores = softmax(preds)
+                part_seg_scores = softmax(preds[:, :3, :, :])
+                label = torch.max(part_seg_scores, dim=1)[1]
+                label[all_seg_scores[:, 3, :, :]>0.5] = 3
+                return label
+
             seg_preds = prediction_batch['seg']
-            seg_scores = softmax(seg_preds)
-            label3 = torch.zeros_like(seg_scores[:, 0, :, :], dtype=torch.long, device=seg_scores.device)
-            label3[seg_scores[:, 3, :, :]>0.5] = 3
-            re_seg_scores = softmax(seg_preds[:, :3, :, :])
-            other_label = torch.max(re_seg_scores, dim=1)[1]
-            pseudo_seg_label = torch.maximum(label3, other_label)
+            with torch.no_grad():
+                pseudo_seg_label = seg_pred_to_label(seg_preds)
+                if self.det_to_seg:
+                    seg_label_from_detection = self.expand_coordinate(positive_coordinate_batch, 15, 15).to(device=device)
+                    nonzero_mask = seg_label_from_detection > 0
+                    pseudo_seg_label[nonzero_mask] = seg_label_from_detection[nonzero_mask]
+                    pseudo_seg_label = self.surrounding_restric(pseudo_seg_label)
+
             meta_batch['seg'] = pseudo_seg_label
+
+            if self.pycda:
+                seg_pool_1 = prediction_batch['seg_pool_1']
+                seg_pool_2 = prediction_batch['seg_pool_2']
+                with torch.no_grad():
+                    meta_batch['seg_pool_1_label'] = seg_pred_to_label(seg_pool_1)
+                    meta_batch['seg_pool_2_label'] = seg_pred_to_label(seg_pool_2)
+
 
         return meta_batch
 
     def score_rectified_by_seg(self, proposals, segmentation):
+        upper_thr = self.cfg.rectify_parameters.upper_thr
+        lower_thr = self.cfg.rectify_parameters.lower_thr
         with torch.no_grad():
             softmax_p = nn.Softmax(dim=1)
             softmax_s = nn.Softmax(dim=0)
             scores = softmax_p(proposals[:, :2])[:, 1]
             new_scores = torch.zeros_like(scores, device=scores.device)
-            # vie_seg = segmentation.cpu().numpy()
-            # vie_seg_after_softmax = softmax_p(segmentation).cpu().numpy()
-            # vie_seg_after_max = torch.max(softmax_p(segmentation), dim=0)[1].cpu().numpy()
             seg = torch.max(softmax_s(segmentation), dim=0)[1]
             proposals[:, :2] = softmax_p(proposals[:, :2])
             proposals[:, 4] = torch.round(proposals[:, 4])
@@ -527,26 +688,86 @@ class LaneATT(nn.Module):
                 for i, pred in enumerate(preds):
                     x_coords = pred[:, 0] - 1
                     y_coords = pred[:, 1] - 1
-                    all_points = seg[y_coords, x_coords]
-                    if len(all_points) != 0:
-                        alpha = torch.sum(all_points).to(torch.float) / (len(all_points) * 3.)
-                        if alpha > 0.8:
+                    all_scores = seg[y_coords, x_coords]
+                    if len(all_scores) != 0:
+                        alpha = torch.sum(all_scores).to(torch.float) / (len(all_scores) * 3.)
+                        if alpha > upper_thr:
                             new_scores[i] = scores[i]
-                        elif alpha < 0.3:
+                        elif alpha < lower_thr:
                             if self.training:
-                                alpha = alpha - 1.3
+                                alpha = alpha - (1 + lower_thr)
                                 new_scores[i] = scores[i] * alpha
                             else:
                                 continue
                         else:
-                            if self.training:
-                                alpha = (0.8 - alpha) / (0.8 - 0.3)
-                                new_scores[i] = scores[i] * (1 - alpha)
-                            else:
-                                new_scores[i] = scores[i]
+                            alpha = (upper_thr - alpha) / (upper_thr - lower_thr)
+                            new_scores[i] = scores[i] * (1 - alpha)
                     else:
                         new_scores[i] = scores[i]
         return new_scores
+
+    def get_anchor_coordinate(self, proposals):
+        starts = torch.round(proposals[:, 2] * self.n_strips).to(dtype=torch.int)
+        ends = torch.round(starts + proposals[:, 4]).to(dtype=torch.int)
+        ends[ends > self.n_offsets] = self.n_offsets
+        coordinate = []
+        for idx, (start, end) in enumerate(zip(starts, ends)):
+            start = start.item()
+            end = end.item()
+            if end > start:
+                x_coordinate = (self.img_w * proposals[idx, start+5:end+5] / self.ori_img_w).view(1, -1)
+                y_coordinate = torch.arange(start, end, 1, dtype=torch.float32, device=x_coordinate.device).view(1, -1)
+                y_coordinate = self.img_h - y_coordinate * (self.img_h / self.n_offsets)
+                group = torch.cat((x_coordinate, y_coordinate), dim=0)
+                factor = round(self.img_h / self.n_offsets)
+                group = torch.round(nn.functional.interpolate(group[None, :, :], scale_factor=factor, mode='linear', align_corners=False))
+                group = torch.squeeze(group).to(dtype=torch.int64)
+                mask_x = (group[0, :] > 0) & (group[0, :] < self.img_w)
+                mask_y = group[1, :] < self.img_h
+                mask = mask_x & mask_y
+                coordinate.append(group[:, mask])
+            else:
+                continue
+
+        return coordinate
+
+    def expand_coordinate(self, coordinate_list, kernel_x=15, kernel_y=15):
+        seg_maps = torch.zeros(len(coordinate_list), self.img_h, self.img_w)
+        for idx, coordinate in enumerate(coordinate_list):
+            for lane in coordinate:
+                seg_maps[idx, lane[1, :], lane[0, :]] = 1
+        kernel_size_x = (round(kernel_x * self.img_w / self.ori_img_w) // 2) * 2 + 1
+        kernel_size_y = (round(kernel_y * self.img_h / self.ori_img_h) // 2) * 2 + 1
+        padding_x = (kernel_size_x - 1) // 2
+        padding_y = (kernel_size_y - 1) // 2
+        mpl = nn.MaxPool2d((kernel_size_y, kernel_size_x), stride=1, padding=(padding_y, padding_x))
+        region_3 = mpl(seg_maps)
+
+        lane_region_kernel_size_x = (round(33 * self.img_w / self.ori_img_w) // 2) * 2 + 1
+        lane_region_kernel_size_y = (round(5 * self.img_w / self.ori_img_w) // 2) * 2 + 1
+        lane_region_padding_x = (lane_region_kernel_size_x - 1) // 2
+        lane_region_padding_y = (lane_region_kernel_size_y - 1) // 2
+        lane_region_mpl = nn.MaxPool2d((lane_region_kernel_size_y, lane_region_kernel_size_x),
+                                       stride=1, padding=(lane_region_padding_y, lane_region_padding_x))
+
+        region_2 = lane_region_mpl(region_3)
+        region_1 = lane_region_mpl(region_2)
+        mask = (region_1 + region_2 + region_3).to(dtype=torch.uint8)
+
+        return  mask
+
+    def surrounding_restric(self, seg):
+        with torch.no_grad():
+            surrounding = seg.clone()
+            surrounding[seg == 3] = 0
+            surrounding[seg == 0] = 1
+            surrounding[seg == 1] = 2
+            surrounding[seg == 2] = 3
+            mpl = nn.MaxPool2d((17, 3), stride=1, padding=(8, 1))
+            reverse_seg = mpl(surrounding.to(torch.float32)).to(torch.long)
+            reverse_seg[seg != 3] = 0
+            seg[reverse_seg == 1] = 0
+            return seg
 
 
 
@@ -665,7 +886,8 @@ class LaneATT(nn.Module):
             # end = label_end
             # if the proposal does not start at the bottom of the image,
             # extend its proposal until the x is outside the image
-            mask = ~((((lane_xs[:start] >= 0.) & (lane_xs[:start] <= 1.)).cpu().numpy()[::-1].cumprod()[::-1]).astype(np.bool))
+            # mask = ~((((lane_xs[:start] >= 0.) & (lane_xs[:start] <= 1.)).cpu().numpy()[::-1].cumprod()[::-1]).astype(np.bool))
+            mask = ~((((lane_xs[:start] >= 0.) & (lane_xs[:start] <= 1.)).flip(0).cumprod(dim=0).flip(0)).to(torch.bool))
             lane_xs[end + 1:] = -2
             lane_xs[:start][mask] = -2
             lane_ys = self.anchor_ys[lane_xs >= 0]
@@ -677,8 +899,8 @@ class LaneATT(nn.Module):
             if get_points:
                 lane_ys = lane_ys[lane_xs <= 1]
                 lane_xs = lane_xs[lane_xs <= 1]
-                lane_xs = torch.round(torch.mul(lane_xs, self.cfg.ori_img_w)).to(dtype=torch.long)
-                lane_ys = torch.round(torch.mul(lane_ys, self.cfg.ori_img_h)).to(dtype=torch.long)
+                lane_xs = torch.round(torch.mul(lane_xs, self.ori_img_w)).to(dtype=torch.long)
+                lane_ys = torch.round(torch.mul(lane_ys, self.ori_img_h)).to(dtype=torch.long)
                 points = torch.stack((lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)), dim=1).squeeze(2)
                 point_lane.append(points)
             else:

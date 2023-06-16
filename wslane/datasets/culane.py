@@ -8,6 +8,7 @@ import cv2
 from tqdm import tqdm
 import logging
 import pickle as pkl
+import random
 
 LIST_FILE = {
     'train': 'list/train_gt.txt',
@@ -36,13 +37,16 @@ CATEGORYS = {
 
 @DATASETS.register_module
 class CULane(BaseDataset):
-    def __init__(self, data_root, split, processes=None, cfg=None):
+    def __init__(self, data_root, split, processes=None, data_size=None, cfg=None):
         super().__init__(data_root, split, processes=processes, cfg=cfg)
         self.list_path = osp.join(data_root, LIST_FILE[split])
         self.split = split
+        self.data_size = data_size
         self.num_branch = cfg.num_branch if 'num_branch' in cfg else False
         self.seg_branch = cfg.seg_branch if 'seg_branch' in cfg else False
         self.load_annotations()
+        self.ori_img_w = 1640
+        self.ori_img_h = 590
 
     def load_annotations(self):
         self.logger.info('Loading CULane annotations...')
@@ -54,6 +58,10 @@ class CULane(BaseDataset):
                 self.data_infos = pkl.load(cache_file)
                 self.max_lanes = max(
                     len(anno['lanes']) for anno in self.data_infos)
+                if self.training:
+                    random.shuffle(self.data_infos)
+                if self.data_size is not None:
+                    self.data_infos = self.data_infos[:self.data_size]
                 return
 
         self.data_infos = []
@@ -65,6 +73,10 @@ class CULane(BaseDataset):
         # cache data infos to file
         with open(cache_path, 'wb') as cache_file:
             pkl.dump(self.data_infos, cache_file)
+        if self.training:
+            random.shuffle(self.data_infos)
+        if self.data_size is not None:
+            self.data_infos = self.data_infos[:self.data_size]
 
     def load_annotation(self, line):
         infos = {}
@@ -160,8 +172,8 @@ class CULane(BaseDataset):
             mask_1 = np.concatenate((zeros, zeros, np.ma.array(seg, mask=(seg==1))*96), axis=2)
             mask_2 = np.concatenate((zeros, np.ma.array(seg, mask=(seg==2))*48, zeros), axis=2)
             mask_3 = np.concatenate((np.ma.array(seg, mask=(seg==3))*32, zeros, zeros), axis=2)
-            mask_4 = np.concatenate((np.ma.array(seg, mask=(seg==3))*24, np.ma.array(seg, mask=(seg==3))*24, zeros), axis=2)
-            img = img + mask_1 + mask_2 + mask_3 + mask_4
+            # mask_4 = np.concatenate((np.ma.array(seg, mask=(seg==4))*12, np.ma.array(seg, mask=(seg==4))*12, zeros), axis=2)
+            img = img + mask_1 + mask_2 + mask_3
 
         anno = data_infos['lanes']
         out_file = osp.join(self.cfg.work_dir, 'visualization', img_name.replace('/', '_'))
@@ -191,9 +203,9 @@ class CULane(BaseDataset):
                                    color=color,
                                    thickness=3 if matches is None else 3)
 
-        if self.num_branch:
-            num = predictions['num_pred'][0]
-            img = cv2.putText(img, num, (20,20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2, cv2.LINE_AA)
+        # if self.num_branch:
+        #     num = predictions['num_pred'][0]
+        #     img = cv2.putText(img, num, (20,20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2, cv2.LINE_AA)
         if not osp.exists(osp.dirname(out_file)):
             os.makedirs(osp.dirname(out_file))
         cv2.imwrite(out_file, img)

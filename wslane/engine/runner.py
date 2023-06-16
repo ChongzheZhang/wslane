@@ -38,6 +38,7 @@ class Runner(object):
         self.eval_loader = None
         self.num_branch = self.cfg.num_branch if 'num_branch' in self.cfg else False
         self.seg_branch = self.cfg.seg_branch if 'seg_branch' in self.cfg else False
+        self.ws_combine_learn = self.cfg.ws_combine_learn if 'ws_combine_learn' in self.cfg else False
 
     def to_cuda(self, batch):
         for k in batch:
@@ -51,11 +52,12 @@ class Runner(object):
             return
         load_network(self.net, self.cfg.load_from, finetune_from=self.cfg.finetune_from, logger=self.recorder.logger)
 
-    def train_epoch(self, epoch, train_loader):
+    def train_epoch(self, epoch, train_loader, target_loader=None):
         self.net.train()
         end = time.time()
         max_iter = len(train_loader)
         for i, data in enumerate(train_loader):
+            data.update({'is_target': True})
             if self.recorder.step >= self.cfg.total_iter:
                 break
             date_time = time.time() - end
@@ -80,9 +82,59 @@ class Runner(object):
             if i % self.cfg.log_interval == 0 or i == max_iter - 1:
                 self.recorder.record('train')
 
+    def wslearn_epoch(self, epoch, train_loader, source_loader):
+        self.net.train()
+        end = time.time()
+        assert len(train_loader) == len(source_loader)
+        max_iter = len(train_loader)
+        targetloader_iter = enumerate(train_loader)
+        sourceloader_iter = enumerate(source_loader)
+        for i in range(max_iter):
+            if self.recorder.step >= self.cfg.total_iter:
+                break
+            date_time = time.time() - end
+            self.recorder.step += 1
+            _, source_data = sourceloader_iter.__next__()
+            source_data = self.to_cuda(source_data)
+            source_output = self.net(source_data)
+            self.optimizer.zero_grad()
+            loss = source_output['loss'].sum()
+            loss.backward()
+            self.optimizer.step()
+            del loss
+            for key in list(source_output['loss_stats']):
+                if 'loss' in key:
+                    source_output['loss_stats'][f'source_{key}'] = source_output['loss_stats'][key]
+                del source_output['loss_stats'][key]
+            self.recorder.update_loss_stats(source_output['loss_stats'])
+
+            _, target_data = targetloader_iter.__next__()
+            target_data.update({'is_target': True})
+            target_data = self.to_cuda(target_data)
+            output = self.net(target_data)
+            self.optimizer.zero_grad()
+            loss = output['loss'].sum()
+            loss.backward()
+            self.optimizer.step()
+            if not self.cfg.lr_update_by_epoch:
+                self.scheduler.step()
+            batch_time = time.time() - end
+            end = time.time()
+            self.recorder.update_loss_stats(output['loss_stats'])
+            self.recorder.batch_time.update(batch_time)
+            self.recorder.data_time.update(date_time)
+
+            lr = self.optimizer.param_groups[0]['lr']
+            self.recorder.lr = lr
+            self.recorder.record_train()
+            if i % self.cfg.log_interval == 0 or i == max_iter - 1:
+                self.recorder.record('train')
+
     def train(self):
         self.recorder.logger.info('Build train loader...')
         train_loader = build_dataloader(self.cfg.dataset.train, self.cfg, is_train=True)
+        if self.ws_combine_learn:
+            source_loader = build_dataloader(self.cfg.dataset.source, self.cfg, is_train=True)
 
         self.recorder.logger.info('Start training...')
         start_epoch = 1
@@ -90,7 +142,10 @@ class Runner(object):
             start_epoch = resume_network(self.cfg.resume_from, self.net, self.optimizer, self.scheduler, self.recorder)
         for epoch in trange(start_epoch, self.cfg.epochs + 1, initial=start_epoch, total=self.cfg.epochs):
             self.recorder.epoch = epoch
-            self.train_epoch(epoch, train_loader)
+            if self.ws_combine_learn:
+                self.wslearn_epoch(epoch, train_loader, source_loader)
+            else:
+                self.train_epoch(epoch, train_loader)
             if epoch >= self.cfg.eval_from or epoch % self.cfg.eval_ep == 0:
                 self.save_ckpt()
                 self.test(on_val=True)
@@ -122,6 +177,7 @@ class Runner(object):
                 self.eval_loader = self.test_loader
         self.net.eval()
         lane_preds = []
+        num_preds = []
         pred_dict = {}
         ntosave = 200
         interval = len(self.eval_loader.dataset.data_infos) // ntosave if len(
@@ -133,6 +189,10 @@ class Runner(object):
                 lane_pred = self.net.module.heads.get_lanes(output)
                 pred_dict['lane_pred'] = lane_pred
                 lane_preds.extend(lane_pred)
+                has_num_branch = self.cfg.num_branch if self.cfg.haskey('num_branch') else False
+                if has_num_branch:
+                    num_pred = self.net.module.get_number(output)
+                    num_preds.append(num_pred)
                     
             if self.cfg.view:
                 if (idx + 1) % interval == 0 and (idx + 1) // interval <= ntosave:

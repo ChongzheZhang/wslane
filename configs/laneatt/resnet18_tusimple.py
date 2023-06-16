@@ -14,11 +14,13 @@ featuremap_out_stride = 32
 
 num_points = 72
 max_lanes = 5
-sample_y = range(710, 150, -10)
+sample_y = range(710, 150, -1)
 
 heads = dict(type='LaneATT',
              anchors_freq_path=None,
              topk_anchors=1000)
+
+seg_branch = True
 
 train_parameters = dict(
     conf_threshold=None,
@@ -36,13 +38,13 @@ optimizer = dict(
   lr = 0.0015,
 )
 
-epochs = 100
+epochs = 80
 batch_size = 40
 total_iter = (3268 // batch_size + 1) * epochs
 scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
 
-eval_from = epochs - 1 # must smaller than epochs
-eval_ep = 1
+eval_from = epochs - 30 # must smaller than epochs
+eval_ep = epochs
 
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1., 1., 1.])
 ori_img_w=1280
@@ -119,3 +121,4 @@ log_interval = 1
 seed=0
 lr_update_by_epoch = False
 num_classes = 4
+seg_weight = [0.5, 1.0, 1.0, 1.5]
