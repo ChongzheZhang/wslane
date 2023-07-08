@@ -47,7 +47,7 @@ class BaseDataset(Dataset):
             if self.new_mask:
                 mask_path = sample['mask_path']
                 path_split = osp.split(mask_path)
-                new_path = osp.join(path_split[0], 'new_mask', path_split[1])
+                new_path = osp.join(path_split[0], 'new_mask_1', path_split[1])
                 label = cv2.imread(new_path, cv2.IMREAD_UNCHANGED)
             else:
                 label = cv2.imread(sample['mask_path'], cv2.IMREAD_UNCHANGED)

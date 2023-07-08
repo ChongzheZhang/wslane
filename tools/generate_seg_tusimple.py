@@ -28,8 +28,8 @@ def gen_label_for_json(args, image_set):
             # ---------- clean and sort lanes -------------
             lanes = []
             _lanes = []
-            slope = [
-            ]  # identify 0th, 1st, 2nd, 3rd, 4th, 5th lane through slope
+            slope = []
+            # identify 0th, 1st, 2nd, 3rd, 4th, 5th lane through slope
             for i in range(len(label['lanes'])):
                 l = [(x, y)
                      for x, y in zip(label['lanes'][i], label['h_samples'])

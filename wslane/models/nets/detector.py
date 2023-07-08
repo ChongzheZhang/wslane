@@ -26,11 +26,16 @@ class Detector(nn.Module):
             batch_numbers = torch.max(batch_numbers, dim=1)[1]
         return batch_numbers
 
-    def get_mask(self, output):
+    def get_mask(self, output, img_size):
         with torch.no_grad():
             softmax = nn.Softmax(dim=1)
-            height = self.cfg.ori_img_h - self.cfg.cut_height
-            batch_seg = nn.functional.interpolate(output['seg'], size=(height, self.cfg.ori_img_w), mode='bilinear',
+            if img_size is not None:
+                height = img_size[0] - self.cfg.cut_height
+                width = img_size[1]
+            else:
+                height = self.cfg.ori_img_h - self.cfg.cut_height
+                width = self.cfg.ori_img_w
+            batch_seg = nn.functional.interpolate(output['seg'], size=(height, width), mode='bilinear',
                                                   align_corners=False)
             batch_seg = softmax(batch_seg)
             batch_seg = torch.max(batch_seg, dim=1)[1]

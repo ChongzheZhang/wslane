@@ -24,13 +24,21 @@ ws_learn = True
 ws_combine_learn = True
 num_branch = False
 seg_branch = True
-tri_loss = False
+tri_loss = True
+pycda = False
+seg_distribution_to_num = True
 det_to_seg = False
-seg_proportion_to_num = False
+
+cls_loss_weight = 1.0
+reg_loss_weight = 1.0
+num_lane_loss_weight = 1.0
+seg_loss_weight = 1.0
+tri_loss_weight = 1.0
+seg_dist_weight = 1.0
 
 train_parameters = dict(
     conf_threshold=None,
-    nms_thres=45.,
+    nms_thres=15.,
     nms_topk=3000
 )
 test_parameters = dict(
@@ -146,10 +154,4 @@ log_interval = 1
 seed=0
 lr_update_by_epoch = False
 num_classes = 4
-seg_weight = [0.5, 1.0, 1.0, 1.5]
-
-cls_loss_weight = 1.0
-reg_loss_weight = 1.0
-num_lane_loss_weight = 1.0
-tri_loss_weight = 1.0
-seg_prop_weight = 0.01
+seg_weight = [0.5, 1.0, 1.5, 2.0]

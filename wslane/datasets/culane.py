@@ -16,6 +16,7 @@ LIST_FILE = {
     'test': 'list/test.txt',
     'debug': 'list/debug.txt',
     'porsche': 'list/porsche.txt',
+    'db': 'list/db.txt',
 }
 
 GT_COLOR = (255, 0, 0)
@@ -37,11 +38,12 @@ CATEGORYS = {
 
 @DATASETS.register_module
 class CULane(BaseDataset):
-    def __init__(self, data_root, split, processes=None, data_size=None, cfg=None):
+    def __init__(self, data_root, split, processes=None, data_size=None, repeat_factor=None, cfg=None):
         super().__init__(data_root, split, processes=processes, cfg=cfg)
         self.list_path = osp.join(data_root, LIST_FILE[split])
         self.split = split
         self.data_size = data_size
+        self.repeat_factor = repeat_factor
         self.num_branch = cfg.num_branch if 'num_branch' in cfg else False
         self.seg_branch = cfg.seg_branch if 'seg_branch' in cfg else False
         self.load_annotations()
@@ -60,6 +62,8 @@ class CULane(BaseDataset):
                     len(anno['lanes']) for anno in self.data_infos)
                 if self.training:
                     random.shuffle(self.data_infos)
+                if self.repeat_factor:
+                    self.data_infos *= self.repeat_factor
                 if self.data_size is not None:
                     self.data_infos = self.data_infos[:self.data_size]
                 return

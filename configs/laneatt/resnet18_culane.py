@@ -120,4 +120,4 @@ log_interval = 1
 seed=0
 lr_update_by_epoch = False
 num_classes = 4
-seg_weight = [0.5, 1.0, 1.0, 1.5]
+seg_weight = [0.5, 1.0, 1.5, 2.0]

@@ -13,28 +13,13 @@ featuremap_out_channel = 512
 featuremap_out_stride = 32 
 
 num_points = 72
-max_lanes = 5
-sample_y = range(710, 150, -10)
+max_lanes = 13
+sample_y = range(589, 230, -1)
 
 heads = dict(type='LaneATT',
-             anchors_freq_path=None,
-             topk_anchors=1000)
+             anchors_freq_path=None,)
 
-ws_learn = True
-ws_combine_learn = True
-num_branch = False
 seg_branch = True
-tri_loss = True
-pycda = False
-det_to_seg = False
-seg_distribution_to_num = False
-
-cls_loss_weight = 1.0
-reg_loss_weight = 1.0
-num_lane_loss_weight = 1.0
-seg_loss_weight = 1.0
-tri_loss_weight = 0.1
-seg_dist_weight = 0.1
 
 train_parameters = dict(
     conf_threshold=None,
@@ -42,37 +27,25 @@ train_parameters = dict(
     nms_topk=3000
 )
 test_parameters = dict(
-    conf_threshold=0.7,
-    nms_thres=45,
+    conf_threshold=0.4,
+    nms_thres=15,
     nms_topk=max_lanes
-)
-pseudo_label_parameters = dict(
-    conf_threshold=0.5,
-    nms_thres=45,
-    max_lanes=10,
-    nlane=5,
-)
-rectify_parameters = dict(
-    upper_thr = 0.8,
-    lower_thr = 0.3,
 )
 
 optimizer = dict(
-  type = 'Adam',
-  lr = 4e-4,
+  type = 'AdamW',
+  lr = 0.0015,
 )
 
-epochs = 1
+epochs = 2
 batch_size = 40
-total_iter = (3268 * 5 // batch_size + 1) * epochs
+total_iter = (10000 // batch_size) * epochs
 scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
 
-eval_from = 0 # must smaller than epochs
-eval_ep = 1
+eval_from = epochs - 15 # must smaller than epochs
+eval_ep = epochs
 
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1., 1., 1.])
-ori_img_w=1280
-ori_img_h=720
 img_w=640
 img_h=360
 cut_height=0
@@ -109,44 +82,33 @@ val_process = [
     dict(type='ToTensor', keys=['img', 'lane_line']),
 ]
 
-dataset_path = './data/tusimple'
-test_json_file = 'data/tusimple/test_label.json'
-dataset_type = 'TuSimple'
-source_dataset_path = './data/CULane'
-source_dataset_type = 'CULane'
+dataset_path = './data/Curvelanes'
+dataset_type = 'Curvelane'
 dataset = dict(
     train=dict(
         type=dataset_type,
         data_root=dataset_path,
         split='train',
         processes=train_process,
-        repeat_factor=5,
     ),
     val=dict(
         type=dataset_type,
         data_root=dataset_path,
-        split='val',
+        split='valid',
         processes=val_process,
     ),
     test=dict(
         type=dataset_type,
         data_root=dataset_path,
-        split='test',
+        split='valid',
         processes=val_process,
     ),
     debug=dict(
         type=dataset_type,
         data_root=dataset_path,
         split='debug',
-        processes=val_process,
-    ),
-    source=dict(
-        type=source_dataset_type,
-        data_root=source_dataset_path,
-        split='train',
         processes=train_process,
-        data_size=3268 * 5,
-    )
+    ),
 )
 
 

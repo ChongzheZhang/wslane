@@ -149,8 +149,9 @@ class Runner(object):
             if epoch >= self.cfg.eval_from or epoch % self.cfg.eval_ep == 0:
                 self.save_ckpt()
                 self.test(on_val=True)
-                if epoch == self.cfg.epochs:
-                    self.test()
+            if epoch == self.cfg.epochs:
+                self.save_ckpt()
+                self.test()
             if self.recorder.step >= self.cfg.total_iter:
                 break
             if self.cfg.lr_update_by_epoch:
@@ -200,7 +201,11 @@ class Runner(object):
                         num_pred = self.net.module.get_number(output)
                         pred_dict['num_pred'] = num_pred
                     if self.seg_branch:
-                        seg_pred = self.net.module.get_mask(output)
+                        if 'img_size' in self.eval_loader.dataset.data_infos[idx]:
+                            img_size = self.eval_loader.dataset.data_infos[idx]['img_size'][:-1]
+                        else:
+                            img_size = None
+                        seg_pred = self.net.module.get_mask(output, img_size)
                         pred_dict['seg_pred'] = seg_pred.cpu().numpy()
                     if hasattr(self.eval_loader.dataset, 'new_view'):
                         self.eval_loader.dataset.new_view(pred_dict, idx)
@@ -210,10 +215,7 @@ class Runner(object):
         self.recorder.logger.info('Result in {} dataset'.format(name))
         out = self.eval_loader.dataset.evaluate(lane_preds, self.cfg.work_dir)
         if isinstance(out, dict):
-            if "Accuracy" in out:
-                self.recorder.logger.info(out['Accuracy'])
-                metric = out['Accuracy']
-            elif "F1" in out:
+            if "F1" in out:
                 self.recorder.logger.info(out['F1'])
                 metric = out['F1']
         else:

@@ -47,6 +47,7 @@ class CLRHead(nn.Module):
         self.ws_learn = self.cfg.ws_learn if 'ws_learn' in cfg else False
         self.tri_loss = self.cfg.tri_loss if 'tri_loss' in cfg else False
         self.pycda = self.cfg.pycda if 'pycda' in cfg else False
+        self.seg_distribution_to_num = self.cfg.seg_distribution_to_num if 'seg_distribution_to_num' in cfg else False
 
         self.register_buffer(name='sample_x_indexs', tensor=(torch.linspace(
             0, 1, steps=self.sample_points, dtype=torch.float32) *
@@ -103,6 +104,12 @@ class CLRHead(nn.Module):
                 nn.Dropout(0.1),
                 nn.Conv2d(inter_channels, self.nlane, 1),
             )
+
+        if self.seg_distribution_to_num:
+            previous_seg_label_ave = nn.Parameter(torch.zeros(1, 3, dtype=torch.float32), requires_grad=False)
+            self.register_parameter(name='previous_seg_label_ave', param=previous_seg_label_ave)
+            previous_number_of_lane_sum = nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+            self.register_parameter(name='previous_number_of_lane_sum', param=previous_number_of_lane_sum)
 
         # init the weights here
         self.init_weights()
@@ -309,6 +316,28 @@ class CLRHead(nn.Module):
             output['seg_pool_1'] = seg_pool_1
             output['seg_pool_2'] = seg_pool_2
 
+        if self.seg_distribution_to_num and self.is_target:
+            seg_scores = F.softmax(seg, dim=1)
+            part_seg_scores = F.softmax(seg, dim=1)[:, :3, :, :]
+            label = torch.max(part_seg_scores, dim=1)[1]
+            label[seg_scores[:, 3, :, :] > 0.5] = 3
+            label1_mask = label != 1
+            label2_mask = label != 2
+            label3_mask = label != 3
+            label1_logits = seg_scores[:, 1, :, :].clone()
+            label1_logits[label1_mask] = 0.
+            label2_logits = seg_scores[:, 2, :, :].clone()
+            label2_logits[label2_mask] = 0.
+            label3_logits = seg_scores[:, 3, :, :].clone()
+            label3_logits[label3_mask] = 0.
+            label1_sum = torch.sum(label1_logits, dim=(2, 1)) / self.img_h
+            label2_sum = torch.sum(label2_logits, dim=(2, 1)) / self.img_h
+            label3_sum = torch.sum(label3_logits, dim=(2, 1)) / self.img_h
+
+            current_seg_label_sum = torch.cat((label1_sum.view(-1, 1), label2_sum.view(-1, 1), label3_sum.view(-1, 1)),
+                                              dim=1)
+            output['current_seg_label_sum'] = current_seg_label_sum
+
         if self.num_branch and self.is_target:
             num_layer_inter = self.num_branch_layers(x[-1])
             mpl = nn.MaxPool2d(num_layer_inter.shape[2:])
@@ -352,19 +381,18 @@ class CLRHead(nn.Module):
             lane_xs = lane_xs[lane_xs >= 0]
             lane_xs = lane_xs.flip(0).double()
             lane_ys = lane_ys.flip(0)
-
-            lane_ys = (lane_ys * (self.cfg.ori_img_h - self.cfg.cut_height) +
-                       self.cfg.cut_height) / self.cfg.ori_img_h
             if len(lane_xs) <= 1:
                 continue
             if get_points:
                 lane_ys = lane_ys[lane_xs <= 1]
                 lane_xs = lane_xs[lane_xs <= 1]
-                lane_xs = torch.round(torch.mul(lane_xs, self.ori_img_w)).to(dtype=torch.long)
-                lane_ys = torch.round(torch.mul(lane_ys, self.ori_img_h)).to(dtype=torch.long)
+                lane_xs = torch.round(torch.mul(lane_xs, self.img_w)).to(dtype=torch.long)
+                lane_ys = torch.round(torch.mul(lane_ys, self.img_h)).to(dtype=torch.long)
                 points = torch.stack((lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)), dim=1).squeeze(2)
                 point_lane.append(points)
             else:
+                lane_ys = (lane_ys * (self.cfg.ori_img_h - self.cfg.cut_height) +
+                           self.cfg.cut_height) / self.cfg.ori_img_h
                 points = torch.stack((lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)), dim=1).squeeze(2)
                 lane = Lane(points=points.cpu().numpy(),
                             metadata={
@@ -372,7 +400,7 @@ class CLRHead(nn.Module):
                                 'start_y': lane[2],
                                 'conf': lane[1]
                             })
-            lanes.append(lane)
+                lanes.append(lane)
         if get_points:
             return point_lane
         else:
@@ -478,7 +506,8 @@ class CLRHead(nn.Module):
                         invalid = reg_targets < 0
                         if torch.any(invalid):
                             reg_targets[invalid] = reg_pred[invalid]
-                    reg_loss = reg_loss + F.smooth_l1_loss(reg_pred, reg_targets) * reg_loss_weight[stage]
+                    # reg_loss = reg_loss + F.smooth_l1_loss(reg_pred, reg_targets) * reg_loss_weight[stage]
+                    reg_loss = reg_loss + liou_loss(reg_pred, reg_targets, self.img_w, length=15) * reg_loss_weight[stage]
                 else:
                     reg_xytl_loss = reg_xytl_loss + F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction='none').mean()
                     iou_loss = iou_loss + liou_loss(reg_pred, reg_targets, self.img_w, length=15)
@@ -518,6 +547,26 @@ class CLRHead(nn.Module):
             seg_pool_2_loss = self.criterion(seg_pool_2_pred, seg_pool_2_target) * seg_loss_weight
             return_value = self.updata_loss_dic(seg_pool_1_loss, 'seg_pool_1_loss', return_value)
             return_value = self.updata_loss_dic(seg_pool_2_loss, 'seg_pool_2_loss', return_value)
+
+        if self.seg_distribution_to_num and self.is_target:
+            seg_dist_weight = self.cfg.seg_dist_weight if 'seg_dist_weight' in self.cfg else 1.0
+            batch_size = batch['number'].shape[0]
+            smooth_l1_loss = nn.SmoothL1Loss()
+            current_num_sum = torch.sum(batch['number'])
+            current_seg_label_sum = output['current_seg_label_sum']
+            seg_label_sum_target = self.previous_seg_label_ave.repeat(batch_size, 1)
+            for i, number in enumerate(batch['number']):
+                seg_label_sum_target[i, :] *= number
+            seg_distribution_loss = smooth_l1_loss(current_seg_label_sum, seg_label_sum_target) * seg_dist_weight
+            return_value = self.updata_loss_dic(seg_distribution_loss, 'seg_distribution_loss', return_value)
+
+            current_seg_label_batch_sum = torch.sum(current_seg_label_sum, dim=0, keepdim=True)
+            previous_seg_label_ave = nn.Parameter((self.previous_seg_label_ave * self.previous_number_of_lane_sum + current_seg_label_batch_sum.detach()) / (
+                    self.previous_number_of_lane_sum + current_num_sum),
+                                                  requires_grad=False)
+            self.previous_seg_label_ave = previous_seg_label_ave
+            self.previous_number_of_lane_sum += current_num_sum
+
         if self.ws_learn and self.is_target:
             return_value['loss_stats']['reg_loss'] = reg_loss
         else:
@@ -574,8 +623,8 @@ class CLRHead(nn.Module):
         targets = meta_batch['number']
         predictions = output['batch_num_lane']
         ce_loss = nn.CrossEntropyLoss()
-        number_lane_loss = ce_loss(predictions, targets) * loss_weight
-        loss_dic = self.updata_loss_dic(number_lane_loss, 'number_lane_loss', loss_dic)
+        num_branch_loss = ce_loss(predictions, targets) * loss_weight
+        loss_dic = self.updata_loss_dic(num_branch_loss, 'num_branch_loss', loss_dic)
 
         return loss_dic
 
@@ -593,9 +642,9 @@ class CLRHead(nn.Module):
         batch_size = meta_batch['img'].shape[0]
         device = meta_batch['img'].device
         predictions = prediction_batch['proposals_after_nms']
-        height = self.cfg.ori_img_h - self.cfg.cut_height
-        segmentations = nn.functional.interpolate(prediction_batch['seg'], size=(height, self.ori_img_w),
-                                                  mode='bilinear', align_corners=False)
+        # segmentations = nn.functional.interpolate(prediction_batch['seg'], size=(self.img_h, self.img_w),
+        #                                           mode='bilinear', align_corners=False)
+        segmentations = prediction_batch['seg']
         anchor_len = predictions[0][0].shape[1]
         pseudo_label = torch.ones(batch_size, max_lanes, anchor_len, dtype=torch.float32, device=device) * -1e5
         positive_pseudo_label_len = torch.zeros((batch_size, 1), device=device)
@@ -741,10 +790,9 @@ class CLRHead(nn.Module):
 
         decoded = []
         predictions_batch = output['predictions_lists'][-1]
-        if self.seg_branch and self.ws_learn:
-            height = self.cfg.ori_img_h - self.cfg.cut_height
-            segmentations = nn.functional.interpolate(output['seg'], size=(height, self.cfg.ori_img_w),
-                                                      mode='bilinear', align_corners=False)
+        # if self.seg_branch and self.ws_learn:
+        #     height = self.cfg.ori_img_h - self.cfg.cut_height
+        #     segmentations = output['seg']
         for idx, predictions in enumerate(predictions_batch):
             # filter out the conf lower than conf threshold
             threshold = self.cfg.test_parameters.conf_threshold
@@ -798,10 +846,6 @@ class CLRHead(nn.Module):
             scores = softmax_p(proposals[:, :2])[:, 1]
             new_scores = torch.zeros_like(scores, device=scores.device)
             seg = torch.max(softmax_s(segmentation), dim=0)[1]
-            if self.cfg.cut_height != 0:
-                zeros_padding = torch.zeros(self.cfg.cut_height, seg.shape[1],
-                                            dtype=torch.int64, device=seg.device)
-                seg = torch.cat((zeros_padding, seg), dim=0)
             proposals[:, 5] = torch.round(proposals[:, 5] * self.n_strips)
             if proposals.shape[0] == 0:
                 return scores

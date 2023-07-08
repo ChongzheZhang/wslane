@@ -20,18 +20,19 @@ heads = dict(type='CLRHead',
 
 ws_learn = True
 ws_combine_learn = True
-num_branch = True
+num_branch = False
 seg_branch = True
 tri_loss = True
-pycda = True
+pycda = False
 
-iou_loss_weight = 1.0
-cls_loss_weight = 0.2
+
+iou_loss_weight = 2.0
+cls_loss_weight = 0.1
 xyt_loss_weight = 0.1
-seg_loss_weight = 0.3
-reg_loss_weight = [5.0, 5.0, 1.0]
+seg_loss_weight = 1.0
+reg_loss_weight = [20.0, 10.0, 1.0]
 num_branch_loss_weight = 1.0
-num_lane_loss_weight = 0.2
+num_lane_loss_weight = 0.3
 tri_loss_weight = 1.0
 
 work_dirs = "work_dirs/clr/r18_tusimple"
@@ -150,3 +151,14 @@ seg_weight = [0.4, 1.0, 1.0, 1.0]
 ignore_label = 255
 # bg_weight = 0.4
 lr_update_by_epoch = False
+
+teacher_process = [
+    dict(type='GenerateLaneLine',
+         transforms=[
+             dict(name='Resize',
+                  parameters=dict(size=dict(height=img_h, width=img_w)),
+                  p=1.0),
+         ],
+    ),
+    dict(type='ToTensor', keys=['img', 'lane_line', 'seg']),
+]

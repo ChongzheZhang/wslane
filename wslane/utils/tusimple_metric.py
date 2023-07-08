@@ -123,7 +123,7 @@ class LaneEval(object):
             'value': accuracy / num,
             'order': 'desc'
         }, {
-            'name': 'F1_score',
+            'name': 'F1',
             'value': f1,
             'order': 'desc'
         }, {

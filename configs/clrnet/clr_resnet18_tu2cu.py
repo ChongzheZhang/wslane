@@ -23,15 +23,17 @@ ws_combine_learn = True
 num_branch = False
 seg_branch = True
 tri_loss = True
+seg_distribution_to_num = True
 
 iou_loss_weight = 2.
-cls_loss_weight = 0.2
+cls_loss_weight = 2.
 xyt_loss_weight = 0.1
-seg_loss_weight = 1.5
-reg_loss_weight = [0.2, 0.2, 0.1]
+seg_loss_weight = 1.0
+reg_loss_weight = [2.0, 1.0, 0.5]
 num_branch_loss_weight = 1.0
-num_lane_loss_weight = 0.2
+num_lane_loss_weight = 16.0
 tri_loss_weight = 1.0
+seg_dist_weight = 1.2
 
 work_dirs = "work_dirs/clr/r18_culane"
 
@@ -45,7 +47,7 @@ test_parameters = dict(conf_threshold=0.2, nms_thres=50, nms_topk=max_lanes)
 pseudo_label_parameters = dict(conf_threshold=0.5, nms_thres=50, max_lanes=10, nlane=5)
 rectify_parameters = dict(upper_thr = 0.5, lower_thr = 0.1)
 
-epochs = 1
+epochs = 3
 batch_size = 40
 
 optimizer = dict(type='AdamW', lr=5e-5)  # 3e-4 for batchsize 8

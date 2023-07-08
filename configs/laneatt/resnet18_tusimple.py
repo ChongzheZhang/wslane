@@ -21,6 +21,7 @@ heads = dict(type='LaneATT',
              topk_anchors=1000)
 
 seg_branch = True
+seg_loss_weight = 1.0
 
 train_parameters = dict(
     conf_threshold=None,
@@ -44,7 +45,7 @@ total_iter = (3268 // batch_size + 1) * epochs
 scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
 
 eval_from = epochs - 30 # must smaller than epochs
-eval_ep = epochs
+eval_ep = 5
 
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1., 1., 1.])
 ori_img_w=1280

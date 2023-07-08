@@ -18,7 +18,7 @@ heads = dict(type='CLRHead',
              fc_hidden_dim=64,
              sample_points=36)
 
-# seg_branch = True
+seg_branch = True
 
 iou_loss_weight = 2.
 cls_loss_weight = 2.
@@ -119,11 +119,11 @@ test=dict(
     processes=val_process,
 ))
 
-workers = 10
+workers = 20
 log_interval = 1
 # seed = 0
-num_classes = 4 + 1
-seg_weight = [0.4, 1.0, 1.0, 1.0, 1.0]
+num_classes = 4
+seg_weight = [0.5, 1.0, 1.0, 1.5]
 ignore_label = 255
 # bg_weight = 0.4
 lr_update_by_epoch = False
