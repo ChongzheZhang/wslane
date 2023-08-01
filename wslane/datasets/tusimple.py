@@ -24,8 +24,8 @@ PRED_MISS_COLOR = (0, 0, 255)
 
 @DATASETS.register_module
 class TuSimple(BaseDataset):
-    def __init__(self, data_root, split, processes=None, data_size=None, repeat_factor=1, cfg=None):
-        super().__init__(data_root, split, processes, cfg)
+    def __init__(self, data_root, split, processes=None, teacher_process=None, data_size=None, repeat_factor=1, cfg=None):
+        super().__init__(data_root, split, processes, teacher_process, cfg)
         self.anno_files = SPLIT_FILES[split]
         self.data_size = data_size
         self.repeat_factor = repeat_factor

@@ -38,8 +38,8 @@ CATEGORYS = {
 
 @DATASETS.register_module
 class CULane(BaseDataset):
-    def __init__(self, data_root, split, processes=None, data_size=None, repeat_factor=None, cfg=None):
-        super().__init__(data_root, split, processes=processes, cfg=cfg)
+    def __init__(self, data_root, split, processes=None, teacher_process=None, data_size=None, repeat_factor=None, cfg=None):
+        super().__init__(data_root, split, processes, teacher_process, cfg)
         self.list_path = osp.join(data_root, LIST_FILE[split])
         self.split = split
         self.data_size = data_size

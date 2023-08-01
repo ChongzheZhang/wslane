@@ -14,6 +14,7 @@ from wslane.ops import nms
 
 from wslane.models.utils.roi_gather import ROIGather, LinearModule
 from wslane.models.utils.seg_decoder import SegDecoder
+from wslane.models.utils.num_branch import NumBranch
 from wslane.models.utils.dynamic_assign import assign
 from wslane.models.losses.lineiou_loss import liou_loss
 from ..registry import HEADS
@@ -47,7 +48,7 @@ class CLRHead(nn.Module):
         self.ws_learn = self.cfg.ws_learn if 'ws_learn' in cfg else False
         self.tri_loss = self.cfg.tri_loss if 'tri_loss' in cfg else False
         self.pycda = self.cfg.pycda if 'pycda' in cfg else False
-        self.seg_distribution_to_num = self.cfg.seg_distribution_to_num if 'seg_distribution_to_num' in cfg else False
+        self.seg_distribution = self.cfg.seg_distribution if 'seg_distribution' in cfg else False
 
         self.register_buffer(name='sample_x_indexs', tensor=(torch.linspace(
             0, 1, steps=self.sample_points, dtype=torch.float32) *
@@ -89,23 +90,16 @@ class CLRHead(nn.Module):
             1)  # n offsets + 1 length + start_x + start_y + theta
         self.cls_layers = nn.Linear(self.fc_hidden_dim, 2)
         if self.tri_loss:
-            self.tri_layers = nn.Linear(self.fc_hidden_dim*refine_layers, 12)
+            self.tri_layer = nn.Linear(self.fc_hidden_dim * self.refine_layers, 12)
 
         weights = torch.FloatTensor(self.cfg.seg_weight)
         self.criterion = torch.nn.NLLLoss(ignore_index=self.cfg.ignore_label, weight=weights)
 
         if self.num_branch:
-            self.nlane = self.cfg.pseudo_label_parameters.nlane + 1
-            inter_channels = prior_feat_channels // 4
-            self.num_branch_layers = nn.Sequential(
-                nn.Conv2d(prior_feat_channels, inter_channels, 3, padding=1, bias=False),
-                nn.BatchNorm2d(inter_channels),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Conv2d(inter_channels, self.nlane, 1),
-            )
+            nlane = self.cfg.pseudo_label_parameters.nlane + 1
+            self.NumBranch = NumBranch(nlane, prior_feat_channels)
 
-        if self.seg_distribution_to_num:
+        if self.seg_distribution:
             previous_seg_label_ave = nn.Parameter(torch.zeros(1, 3, dtype=torch.float32), requires_grad=False)
             self.register_parameter(name='previous_seg_label_ave', param=previous_seg_label_ave)
             previous_number_of_lane_sum = nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
@@ -124,7 +118,7 @@ class CLRHead(nn.Module):
             nn.init.normal_(m, mean=0., std=1e-3)
 
         if self.tri_loss:
-            for m in self.tri_layers.parameters():
+            for m in self.tri_layer.parameters():
                 nn.init.normal_(m, mean=0., std=1e-3)
 
     def pool_prior_features(self, batch_features, num_priors, prior_xs):
@@ -221,8 +215,14 @@ class CLRHead(nn.Module):
         '''
         if self.training:
             self.is_target = kwargs['batch']['is_target'] if 'is_target' in kwargs['batch'] else False
+            self.is_student = kwargs['batch']['teacher_student'] if 'teacher_student' in kwargs['batch'] else False
         else:
             self.is_target = True
+            self.is_student = True
+
+        self.num_branch_trigger = self.num_branch and self.is_target and self.is_student
+        self.tri_loss_trigger = self.tri_loss and self.is_target
+        self.seg_distribution_trigger = self.seg_distribution and self.is_target and self.is_student
         output = {}
         batch_features = list(x[len(x) - self.refine_layers:])
         batch_features.reverse()
@@ -261,7 +261,7 @@ class CLRHead(nn.Module):
             cls_logits = cls_logits.reshape(
                 batch_size, -1, cls_logits.shape[1])  # (B, num_priors, 2)
             reg = reg.reshape(batch_size, -1, reg.shape[1])
-            if self.tri_loss and self.is_target:
+            if self.tri_loss_trigger:
                 reg_features = reg_features.reshape(batch_size, -1, reg_features.shape[1])
                 fc_features = fc_features.reshape(batch_size, -1, fc_features.shape[1])
                 reg_features = reg_features + fc_features
@@ -269,7 +269,7 @@ class CLRHead(nn.Module):
                 if stage == 0:
                     output['anchor_features'] = reg_features
                 elif stage == (self.refine_layers - 1):
-                    output['anchor_features'] = self.tri_layers(torch.cat((output['anchor_features'], reg_features), dim=-1))
+                    output['anchor_features'] = self.tri_layer(torch.cat((output['anchor_features'], reg_features), dim=-1))
                 else:
                     output['anchor_features'] = torch.cat((output['anchor_features'], reg_features), dim=-1)
 
@@ -316,7 +316,7 @@ class CLRHead(nn.Module):
             output['seg_pool_1'] = seg_pool_1
             output['seg_pool_2'] = seg_pool_2
 
-        if self.seg_distribution_to_num and self.is_target:
+        if self.seg_distribution_trigger:
             seg_scores = F.softmax(seg, dim=1)
             part_seg_scores = F.softmax(seg, dim=1)[:, :3, :, :]
             label = torch.max(part_seg_scores, dim=1)[1]
@@ -338,22 +338,14 @@ class CLRHead(nn.Module):
                                               dim=1)
             output['current_seg_label_sum'] = current_seg_label_sum
 
-        if self.num_branch and self.is_target:
-            num_layer_inter = self.num_branch_layers(x[-1])
-            mpl = nn.MaxPool2d(num_layer_inter.shape[2:])
-            output['batch_num_lane'] = mpl(num_layer_inter).view(-1, self.nlane)
+        if self.num_branch_trigger:
+            output['batch_num_lane'] = self.NumBranch(x[-1])
 
+        if self.ws_learn and self.is_target:
+            nms_thres = self.cfg.pseudo_label_parameters.nms_thres
+            output['proposals_after_nms'] = self.nms(output['predictions_lists'][-1], nms_thres)
 
-        if self.training:
-            if self.ws_learn and self.is_target:
-                nms_thres = self.cfg.pseudo_label_parameters.nms_thres
-                output['proposals_after_nms'] = self.nms(output['predictions_lists'][-1], nms_thres)
-                meta_batch = self.generate_pseudo_label(output, kwargs['batch'])
-            else:
-                meta_batch = kwargs['batch']
-            return self.loss(output, meta_batch)
-        else:
-            return output
+        return output
 
     def predictions_to_pred(self, predictions, get_points=False):
         '''
@@ -423,7 +415,7 @@ class CLRHead(nn.Module):
             seg_loss_weight = self.cfg.seg_loss_weight
         num_branch_loss_weight = self.cfg.num_branch_loss_weight if self.cfg.haskey('num_branch_loss_weight') else 1.0
         num_lane_loss_weight = self.cfg.num_lane_loss_weight if self.cfg.haskey('num_lane_loss_weight') else 1.0
-        reg_loss_weight = self.cfg.reg_loss_weight if self.cfg.haskey('reg_loss_weight') else [1.0, 1.0]
+        reg_loss_weight = self.cfg.reg_loss_weight if self.cfg.haskey('reg_loss_weight') else [1.0, 1.0, 1.0]
 
         predictions_lists = output['predictions_lists']
         targets = batch['lane_line'].clone()
@@ -506,7 +498,6 @@ class CLRHead(nn.Module):
                         invalid = reg_targets < 0
                         if torch.any(invalid):
                             reg_targets[invalid] = reg_pred[invalid]
-                    # reg_loss = reg_loss + F.smooth_l1_loss(reg_pred, reg_targets) * reg_loss_weight[stage]
                     reg_loss = reg_loss + liou_loss(reg_pred, reg_targets, self.img_w, length=15) * reg_loss_weight[stage]
                 else:
                     reg_xytl_loss = reg_xytl_loss + F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction='none').mean()
@@ -548,17 +539,12 @@ class CLRHead(nn.Module):
             return_value = self.updata_loss_dic(seg_pool_1_loss, 'seg_pool_1_loss', return_value)
             return_value = self.updata_loss_dic(seg_pool_2_loss, 'seg_pool_2_loss', return_value)
 
-        if self.seg_distribution_to_num and self.is_target:
+        if self.seg_distribution and self.is_target:
             seg_dist_weight = self.cfg.seg_dist_weight if 'seg_dist_weight' in self.cfg else 1.0
             batch_size = batch['number'].shape[0]
             smooth_l1_loss = nn.SmoothL1Loss()
             current_num_sum = torch.sum(batch['number'])
             current_seg_label_sum = output['current_seg_label_sum']
-            seg_label_sum_target = self.previous_seg_label_ave.repeat(batch_size, 1)
-            for i, number in enumerate(batch['number']):
-                seg_label_sum_target[i, :] *= number
-            seg_distribution_loss = smooth_l1_loss(current_seg_label_sum, seg_label_sum_target) * seg_dist_weight
-            return_value = self.updata_loss_dic(seg_distribution_loss, 'seg_distribution_loss', return_value)
 
             current_seg_label_batch_sum = torch.sum(current_seg_label_sum, dim=0, keepdim=True)
             previous_seg_label_ave = nn.Parameter((self.previous_seg_label_ave * self.previous_number_of_lane_sum + current_seg_label_batch_sum.detach()) / (
@@ -567,21 +553,62 @@ class CLRHead(nn.Module):
             self.previous_seg_label_ave = previous_seg_label_ave
             self.previous_number_of_lane_sum += current_num_sum
 
+            seg_label_sum_target = self.previous_seg_label_ave.repeat(batch_size, 1)
+            for i, number in enumerate(batch['number']):
+                seg_label_sum_target[i, :] *= number
+            seg_distribution_loss = smooth_l1_loss(current_seg_label_sum, seg_label_sum_target) * seg_dist_weight
+            return_value = self.updata_loss_dic(seg_distribution_loss, 'seg_distribution_loss', return_value)
+
         if self.ws_learn and self.is_target:
             return_value['loss_stats']['reg_loss'] = reg_loss
         else:
             return_value['loss_stats']['iou_loss'] = iou_loss * iou_loss_weight
 
         if self.num_branch and self.is_target:
-            return_value = self.num_branch_loss(output, batch, return_value, num_branch_loss_weight)
+            num_branch_loss = self.NumBranch.loss(output['batch_num_lane'], batch['number'], num_branch_loss_weight)
+            return_value = self.updata_loss_dic(num_branch_loss, 'num_branch_loss', return_value)
 
         if self.tri_loss and self.is_target:
-            tri_loss = 0
-            non_zero_counter = 0
-            triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
-            tri_loss_weight = self.cfg.tri_loss_weight if self.cfg.haskey('tri_loss_weight') else 1.0
-            for positive_target, negative_target in zip(batch['positive_target'], batch['negative_target']):
-                device = positive_target.device
+            return_value = self.triplet_loss(batch, return_value)
+
+        if 'positive_pseudo_label_len' in batch:
+            positive_pseudo_label_len = batch['positive_pseudo_label_len']
+            number_gt = batch['number'].view(-1, 1)
+            mse_loss = nn.MSELoss()
+            number_lane_loss = mse_loss(positive_pseudo_label_len, number_gt.to(dtype=torch.float32)) * num_lane_loss_weight
+            return_value = self.updata_loss_dic(number_lane_loss, 'number_lane_loss', return_value)
+
+        if 'average_pseudo_number_of_lane' in batch:
+            return_value['loss_stats']['ave_pseudo_lane'] = batch['average_pseudo_number_of_lane']
+
+        # for i in range(self.refine_layers):
+        #     return_value['loss_stats']['stage_{}_acc'.format(i)] = cls_acc[i]
+
+        return return_value
+
+    def triplet_loss(self, batch, loss_dic):
+        tri_loss = 0
+        non_zero_counter = 0
+        triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
+        tri_loss_weight = self.cfg.tri_loss_weight if self.cfg.haskey('tri_loss_weight') else 1.0
+        positive_targets = batch['positive_target']
+        negative_targets = batch['negative_target']
+        anchors = batch['anchor'] if 'anchor' in batch else None
+        device = negative_targets[0].device
+        if anchors is not None:
+            for anchor, positive_target, negative_target in zip(anchors, positive_targets, negative_targets):
+                anchor_len = anchor.shape[0]
+                positive_len = positive_target.shape[0]
+                negative_len = negative_target.shape[0]
+                tri_sample_len = min(anchor_len, positive_len, negative_len)
+                anchor = anchor[:tri_sample_len, :]
+                positive_target = positive_target[:tri_sample_len, :]
+                negative_target = negative_target[:tri_sample_len, :]
+                if tri_sample_len != 0:
+                    non_zero_counter += 1
+                    tri_loss += triplet_loss(anchor, positive_target, negative_target) * tri_loss_weight
+        else:
+            for positive_target, negative_target in zip(positive_targets, negative_targets):
                 positive_len = positive_target.shape[0]
                 negative_len = negative_target.shape[0]
                 tri_sample_len = min(positive_len, negative_len)
@@ -601,30 +628,8 @@ class CLRHead(nn.Module):
                         positive_target = positive_target[mask]
                         negative_target = negative_target[:tri_sample_len - 1, ...].repeat(tri_sample_len, 1)
                     tri_loss += triplet_loss(tri_anchor, positive_target, negative_target) * tri_loss_weight
-            tri_loss /= (non_zero_counter + 1e-3)
-            return_value = self.updata_loss_dic(tri_loss, 'tri_loss', return_value)
-
-        if 'positive_pseudo_label_len' in batch:
-            positive_pseudo_label_len = batch['positive_pseudo_label_len']
-            number_gt = batch['number'].view(-1, 1)
-            mse_loss = nn.MSELoss()
-            number_lane_loss = mse_loss(positive_pseudo_label_len, number_gt.to(dtype=torch.float32)) * num_lane_loss_weight
-            return_value = self.updata_loss_dic(number_lane_loss, 'number_lane_loss', return_value)
-
-        if 'average_pseudo_number_of_lane' in batch:
-            return_value['loss_stats']['ave_pseudo_lane'] = batch['average_pseudo_number_of_lane']
-
-        # for i in range(self.refine_layers):
-        #     return_value['loss_stats']['stage_{}_acc'.format(i)] = cls_acc[i]
-
-        return return_value
-
-    def num_branch_loss(self, output, meta_batch, loss_dic, loss_weight=1.0):
-        targets = meta_batch['number']
-        predictions = output['batch_num_lane']
-        ce_loss = nn.CrossEntropyLoss()
-        num_branch_loss = ce_loss(predictions, targets) * loss_weight
-        loss_dic = self.updata_loss_dic(num_branch_loss, 'num_branch_loss', loss_dic)
+        tri_loss /= (non_zero_counter + 1e-3)
+        loss_dic = self.updata_loss_dic(tri_loss, 'tri_loss', loss_dic)
 
         return loss_dic
 
@@ -663,10 +668,10 @@ class CLRHead(nn.Module):
                 new_anchor_idx = anchor_idx.clone()
                 segmentation = segmentations[i, ...]
                 new_scores = self.score_rectified_by_seg(new_proposals, segmentation)
-                _, negative_inices = torch.sort(new_scores)
-                negative_len = min(10, new_scores.shape[0])
-                negative_inices = negative_inices[:negative_len]
-                new_anchor_idx = new_anchor_idx[negative_inices]
+                _, negative_indices = torch.sort(new_scores)
+                negative_len = min(20, new_scores.shape[0])
+                negative_indices = negative_indices[:negative_len]
+                new_anchor_idx = new_anchor_idx[negative_indices]
                 negative_anchor_features = anchor_features_tri[new_anchor_idx]
                 meta_batch['negative_target'].append(negative_anchor_features)
 
@@ -705,7 +710,7 @@ class CLRHead(nn.Module):
                 num_scores = softmax(lane_num_proposals)[:, 1]
                 positive_pseudo_label_len[i, 0] = num_scores.sum()
             if self.tri_loss:
-                not_equal_mask = torch.all(lane_num_to_keep.unsqueeze(1) != negative_inices.unsqueeze(0), dim=1)
+                not_equal_mask = torch.all(lane_num_to_keep.unsqueeze(1) != negative_indices.unsqueeze(0), dim=1)
                 lane_num_to_keep_in_tri = lane_num_to_keep[not_equal_mask]
                 positive_anchor_features_idx = anchor_idx[lane_num_to_keep_in_tri]
                 positive_anchor_features = anchor_features_tri[positive_anchor_features_idx]
@@ -760,6 +765,153 @@ class CLRHead(nn.Module):
                     seg_pool_2 = prediction_batch['seg_pool_2']
                     meta_batch['seg_pool_1_label'] = seg_pred_to_label(seg_pool_1)
                     meta_batch['seg_pool_2_label'] = seg_pred_to_label(seg_pool_2)
+
+        return meta_batch
+
+
+    def teacher_pseudo_label(self, prediction_batch, meta_batch):
+        softmax = nn.Softmax(dim=1)
+        param = self.cfg.pseudo_label_parameters
+        conf_threshold = param.conf_threshold
+        max_lanes = param.max_lanes
+        batch_size = meta_batch['img'].shape[0]
+        device = meta_batch['img'].device
+        predictions = prediction_batch['proposals_after_nms']
+        segmentations = prediction_batch['seg']
+        # numbers = meta_batch['number'] == 0
+        anchor_len = predictions[0][0].shape[1]
+        pseudo_label = torch.ones(batch_size, max_lanes, anchor_len, dtype=torch.float32, device=device) * -1e5
+        pseudo_label[:, :, 0] = 1
+        pseudo_label[:, :, 1] = 0
+        max_lane = 0
+        pseudo_number_of_lane = 0
+        meta_batch['positive_target'] = []
+        for i, (proposals, anchor_idx) in enumerate(predictions):
+            if self.tri_loss:
+                if not self.seg_branch:
+                    raise ValueError("Triplet Loss or Detection Results to Segmetation Label must have Segmentation branch")
+                anchor_features_tri = prediction_batch['anchor_features'][i, ...]
+                new_proposals = proposals.clone()
+                segmentation = segmentations[i, ...]
+                new_scores = self.score_rectified_by_seg(new_proposals, segmentation)
+                _, negative_indices = torch.sort(new_scores)
+                negative_len = min(20, new_scores.shape[0])
+                negative_indices = negative_indices[:negative_len]
+
+            with torch.no_grad():
+                lane_num_to_keep = torch.arange(proposals.shape[0], dtype=torch.int64, device=device)
+
+                scores = softmax(proposals[:, :2])[:, 1]
+                mask = scores > conf_threshold
+                proposals = proposals[mask]
+                lane_num_to_keep = lane_num_to_keep[mask]
+
+                pre_length = proposals[:, 2] * self.n_strips + proposals[:, 5]
+                valid_length = pre_length < self.n_strips
+                proposals = proposals[valid_length]
+                lane_num_to_keep = lane_num_to_keep[valid_length]
+
+                if proposals.shape[0] != 0:
+                    proposals[:, 0] = 0
+                    proposals[:, 1] = 1
+                    proposals[:, 2:6] = torch.clamp(proposals[:, 2:6], min=0, max=1)
+                    proposals[:, 3] = proposals[:, 3] * (self.img_w - 1)
+                    proposals[:, 5] = torch.round(proposals[:, 5] * self.n_strips)
+                    proposals[:, 6:] *= (self.img_w - 1)
+                    all_lane_length = torch.round(proposals[:, 2] * self.n_strips) + proposals[:, 5]
+                    for k, lane_length in enumerate(all_lane_length.to(torch.int)):
+                        proposals[k, 5 + lane_length.item():] = -1e5
+
+                    these_lanes = min(proposals.shape[0], max_lanes)
+                    pseudo_label[i, :these_lanes, :] = proposals[:these_lanes, :]
+                    pseudo_number_of_lane += these_lanes
+                    if these_lanes > max_lane:
+                        max_lane = these_lanes
+
+                if self.tri_loss:
+                    not_equal_mask = torch.all(lane_num_to_keep.unsqueeze(1) != negative_indices.unsqueeze(0), dim=1)
+                    lane_num_to_keep_in_tri = lane_num_to_keep[not_equal_mask]
+                    positive_anchor_features_idx = anchor_idx[lane_num_to_keep_in_tri]
+                    positive_anchor_features = anchor_features_tri[positive_anchor_features_idx]
+                    meta_batch['positive_target'].append(positive_anchor_features)
+
+        pseudo_number_of_lane /= batch_size
+        max_lane = max(max_lane, 4)
+        pseudo_label = pseudo_label[:, :max_lane, :]
+
+        meta_batch['lane_line'] = pseudo_label
+        meta_batch['average_pseudo_number_of_lane'] = pseudo_number_of_lane
+
+        if self.seg_branch:
+            def seg_pred_to_label(preds):
+                softmax = nn.Softmax(dim=1)
+                all_seg_scores = softmax(preds)
+                part_seg_scores = softmax(preds[:, :3, :, :])
+                label = torch.max(part_seg_scores, dim=1)[1]
+                label[all_seg_scores[:, 3, :, :]>0.5] = 3
+                return label
+
+            with torch.no_grad():
+                seg_preds = prediction_batch['seg']
+                pseudo_seg_label = seg_pred_to_label(seg_preds)
+                # pseudo_seg_label[numbers, ...] = 0
+                meta_batch['seg'] = pseudo_seg_label
+
+        return meta_batch
+
+
+    def student_pseudo_label(self, prediction_batch, meta_batch):
+        softmax = nn.Softmax(dim=1)
+        param = self.cfg.pseudo_label_parameters
+        conf_threshold = param.conf_threshold
+        batch_size = meta_batch['img'].shape[0]
+        device = meta_batch['img'].device
+        predictions = prediction_batch['proposals_after_nms']
+        segmentations = prediction_batch['seg']
+        positive_pseudo_label_len = torch.zeros((batch_size, 1), device=device)
+        meta_batch['negative_target'] = []
+        meta_batch['anchor'] = []
+        for i, (proposals, anchor_idx) in enumerate(predictions):
+            if self.tri_loss:
+                if not self.seg_branch:
+                    raise ValueError("Triplet Loss or Detection Results to Segmetation Label must have Segmentation branch")
+                anchor_features_tri = prediction_batch['anchor_features'][i, ...]
+                new_proposals = proposals.clone()
+                new_anchor_idx = anchor_idx.clone()
+                segmentation = segmentations[i, ...]
+                new_scores = self.score_rectified_by_seg(new_proposals, segmentation)
+                _, negative_indices = torch.sort(new_scores)
+                negative_len = min(20, new_scores.shape[0])
+                negative_indices = negative_indices[:negative_len]
+                new_anchor_idx = new_anchor_idx[negative_indices]
+                negative_anchor_features = anchor_features_tri[new_anchor_idx]
+                meta_batch['negative_target'].append(negative_anchor_features)
+
+            with torch.no_grad():
+                lane_num_to_keep = torch.arange(proposals.shape[0], dtype=torch.int64, device=device)
+
+                scores = softmax(proposals[:, :2])[:, 1]
+                mask = scores > conf_threshold
+                proposals = proposals[mask]
+                lane_num_to_keep = lane_num_to_keep[mask]
+
+                pre_length = proposals[:, 2] * self.n_strips + proposals[:, 5]
+                valid_length = pre_length < self.n_strips
+                lane_num_to_keep = lane_num_to_keep[valid_length]
+
+            lane_num_proposals = predictions[i][0][lane_num_to_keep, :2]
+            if lane_num_proposals.shape[0] > 0:
+                num_scores = softmax(lane_num_proposals)[:, 1]
+                positive_pseudo_label_len[i, 0] = num_scores.sum()
+            if self.tri_loss:
+                not_equal_mask = torch.all(lane_num_to_keep.unsqueeze(1) != negative_indices.unsqueeze(0), dim=1)
+                lane_num_to_keep_in_tri = lane_num_to_keep[not_equal_mask]
+                positive_anchor_features_idx = anchor_idx[lane_num_to_keep_in_tri]
+                positive_anchor_features = anchor_features_tri[positive_anchor_features_idx]
+                meta_batch['anchor'].append(positive_anchor_features)
+
+        meta_batch['positive_pseudo_label_len'] = positive_pseudo_label_len
+        meta_batch['average_pseudo_number_of_lane'] = torch.tensor(meta_batch['average_pseudo_number_of_lane'])
 
         return meta_batch
 

@@ -14,7 +14,7 @@ from mmcv.parallel import DataContainer as DC
 
 @DATASETS.register_module
 class BaseDataset(Dataset):
-    def __init__(self, data_root, split, processes=None, cfg=None):
+    def __init__(self, data_root, split, processes=None, teacher_process=None, cfg=None):
         self.cfg = cfg
         self.logger = logging.getLogger(__name__)
         self.data_root = data_root
@@ -22,6 +22,7 @@ class BaseDataset(Dataset):
         self.processes = Process(processes, cfg)
         self.new_mask = cfg.seg_branch if 'seg_branch' in cfg else False
         # self.new_mask = False
+        self.teacher_process = Process(teacher_process, cfg) if teacher_process is not None else None
 
     def view(self, predictions, img_metas):
         img_metas = [item for img_meta in img_metas.data for item in img_meta]
@@ -65,8 +66,10 @@ class BaseDataset(Dataset):
                         lanes.append((p[0], p[1] - self.cfg.cut_height))
                     new_lanes.append(lanes)
                 sample.update({'lanes': new_lanes})
-
-        sample = self.processes(sample)
+        if self.teacher_process is not None:
+            sample = self.teacher_process(sample)
+        else:
+            sample = self.processes(sample)
         meta = {'full_img_path': data_info['img_path'],
                 'img_name': data_info['img_name']}
         meta = DC(meta, cpu_only=True)
@@ -77,3 +80,35 @@ class BaseDataset(Dataset):
             sample.update({'number': len(data_info['lanes'])})
 
         return sample
+
+    def re_process(self, meta_batch):
+        device = meta_batch['img'].device
+        imgs = meta_batch['img'].cpu().numpy() * 255.
+        imgs = np.transpose(imgs, (0, 2, 3, 1)).astype(np.uint8)
+        segs = meta_batch['seg'].cpu().numpy().astype(np.uint8)
+        y_cord = np.linspace(self.cfg.img_h-1, 0, num=self.cfg.num_points)
+        batch_lanes = []
+        lane_line = meta_batch['lane_line'].cpu().numpy()
+        for batch in lane_line:
+            lanes = []
+            for line in batch:
+                line = line[-72:]
+                line = np.concatenate((line[:,None], y_cord[:,None]), axis=1)
+                lane = line[line[:, 0]>0]
+                lane = np.flip(lane, axis=0)
+                if len(lane) > 2:
+                    lanes.append(lane.tolist())
+            if len(lanes) > 0:
+                batch_lanes.append(lanes)
+
+        shape = meta_batch['lane_line'].shape
+        lanes_tensor = torch.zeros(shape[0], self.cfg.max_lanes, shape[2], dtype=torch.float32, device=device)
+        for idx, (img, seg, lanes) in enumerate(zip(imgs, segs, batch_lanes)):
+            sample = {'img':img, 'mask':seg, 'lanes':lanes}
+            sample = self.processes(sample)
+            meta_batch['img'][idx, ...] = sample['img'].to(device=device)
+            meta_batch['seg'][idx, ...] = sample['seg'].to(device=device, dtype=torch.int64)
+            lanes_tensor[idx, ...] = torch.from_numpy(sample['lane_line']).to(device=device)
+        meta_batch['lane_line'] = lanes_tensor
+
+        return meta_batch

@@ -1,15 +1,17 @@
 net = dict(type='Detector', )
 
-backbone = dict(
-    type='ResNetWrapper',
-    resnet='resnet18',
+backbone=dict(
+    type='TIMMBackbone',
+    model_name='convnextv2_atto.fcmae_ft_in1k',
+    features_only=True,
     pretrained=True,
-    replace_stride_with_dilation=[False, False, False],
-    out_conv=False,
+    use_hack_weight=True,
+    out_indices=[0, 1, 2, 3],
+    hack_weight_path="/home/fvf6zk6/Workspace/Pretrained-Weights/timm/convnextv2_atto.fcmae_ft_in1k_converted.pth",
 )
 
 num_points = 72
-max_lanes = 5
+max_lanes = 4
 sample_y = range(589, 230, -1)
 
 heads = dict(type='CLRHead',
@@ -18,46 +20,32 @@ heads = dict(type='CLRHead',
              fc_hidden_dim=64,
              sample_points=36)
 
-ws_learn = True
-ws_combine_learn = True
-num_branch = False
 seg_branch = True
-tri_loss = True
-seg_distribution = True
-kd_learn = True
-ema = True
 
-iou_loss_weight = 2. # fixed
-cls_loss_weight = 6. # fixed
-xyt_loss_weight = 0.1 # fixed
-seg_loss_weight = 1.0 # fixed
-reg_loss_weight = [36.0, 6.0, 1.0] # fixed
-num_branch_loss_weight = 1.0
-num_lane_loss_weight = 1.0 # fixed
-tri_loss_weight = 4.0 # fixed
-seg_dist_weight = 0.5
+iou_loss_weight = 2.
+cls_loss_weight = 2.
+xyt_loss_weight = 0.2
+seg_loss_weight = 1.0
 
 work_dirs = "work_dirs/clr/r18_culane"
 
 neck = dict(type='FPN',
-            in_channels=[128, 256, 512],
+            in_channels=[80, 160, 320],
             out_channels=64,
             num_outs=3,
             attention=False)
 
-test_parameters = dict(conf_threshold=0.2, nms_thres=50, nms_topk=max_lanes)
-pseudo_label_parameters = dict(conf_threshold=0.4, nms_thres=50, max_lanes=5, nlane=5)
-rectify_parameters = dict(upper_thr = 0.5, lower_thr = 0.1)
+test_parameters = dict(conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
 
-epochs = 1
+epochs = 15
 batch_size = 40
 
-optimizer = dict(type='AdamW', lr=5.0e-5)  # 3e-4 for batchsize 8
-total_iter = (88880 // batch_size) * epochs
+optimizer = dict(type='AdamW', lr=1e-3)  # 3e-4 for batchsize 8
+total_iter = (88880 // batch_size + 1) * epochs
 scheduler = dict(type='CosineAnnealingLR', T_max=total_iter)
 
-eval_from = 0 # must smaller than epochs
-eval_ep = 1
+eval_from = epochs - 5 # must smaller than epochs
+eval_ep = 3
 
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1., 1., 1.])
 ori_img_w = 1640
@@ -114,14 +102,11 @@ val_process = [
 
 dataset_path = './data/CULane'
 dataset_type = 'CULane'
-source_dataset_path = './data/tusimple'
-source_dataset_type = 'TuSimple'
 dataset = dict(train=dict(
     type=dataset_type,
     data_root=dataset_path,
     split='train',
     processes=train_process,
-    teacher_process=val_process,
 ),
 val=dict(
     type=dataset_type,
@@ -134,22 +119,12 @@ test=dict(
     data_root=dataset_path,
     split='test',
     processes=val_process,
-),
-source=dict(
-    type=source_dataset_type,
-    data_root=source_dataset_path,
-    split='train',
-    processes=train_process,
-    data_size=88880,
-    repeat_factor=(88880 // 3268 + 1),
-)
-)
+))
 
-workers = 12
+workers = 10
 log_interval = 1
 # seed = 0
 num_classes = 4
 seg_weight = [0.4, 1.0, 1.0, 1.0]
 ignore_label = 255
-# bg_weight = 0.4
 lr_update_by_epoch = False

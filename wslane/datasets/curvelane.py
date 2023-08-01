@@ -24,8 +24,8 @@ PRED_MISS_COLOR = (0, 0, 255)
 
 @DATASETS.register_module
 class Curvelane(BaseDataset):
-    def __init__(self, data_root, split, processes=None, data_size=None, cfg=None):
-        super().__init__(data_root, split, processes=processes, cfg=cfg)
+    def __init__(self, data_root, split, processes=None, teacher_process=None, data_size=None, cfg=None):
+        super().__init__(data_root, split, processes, teacher_process, cfg)
         self.list_path = osp.join(data_root, LIST_FILE[split])
         self.split = split
         self.data_size = data_size

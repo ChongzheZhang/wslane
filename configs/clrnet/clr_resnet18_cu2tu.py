@@ -24,16 +24,19 @@ num_branch = False
 seg_branch = True
 tri_loss = True
 pycda = False
+seg_distribution = False
+kd_learn = True
 
 
-iou_loss_weight = 2.0
-cls_loss_weight = 0.1
-xyt_loss_weight = 0.1
-seg_loss_weight = 1.0
-reg_loss_weight = [20.0, 10.0, 1.0]
+iou_loss_weight = 3.0 # fixed
+cls_loss_weight = 0.1 # fixed
+xyt_loss_weight = 0.1 # fixed
+seg_loss_weight = 0.2 # fixed
+reg_loss_weight = [12.0, 6.0, 3.0] # fixed
 num_branch_loss_weight = 1.0
-num_lane_loss_weight = 0.3
-tri_loss_weight = 1.0
+num_lane_loss_weight = 1.0 # fixed
+tri_loss_weight = 1.5 # fixed
+seg_dist_weight = 0.003
 
 work_dirs = "work_dirs/clr/r18_tusimple"
 
@@ -43,14 +46,14 @@ neck = dict(type='FPN',
             num_outs=3,
             attention=False)
 
-test_parameters = dict(conf_threshold=0.7, nms_thres=50, nms_topk=max_lanes)
+test_parameters = dict(conf_threshold=0.8, nms_thres=50, nms_topk=max_lanes)
 pseudo_label_parameters = dict(conf_threshold=0.5, nms_thres=50, max_lanes=10, nlane=5)
 rectify_parameters = dict(upper_thr = 0.5, lower_thr = 0.1)
 
 epochs = 1
 batch_size = 40
 
-optimizer = dict(type='AdamW', lr=1.0e-4)  # 3e-4 for batchsize 8
+optimizer = dict(type='AdamW', lr=4.0e-5)  # 3e-4 for batchsize 8
 total_iter = (3268 * 3 // batch_size + 1) * epochs
 scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
 
@@ -120,6 +123,7 @@ dataset = dict(train=dict(
     data_root=dataset_path,
     split='train',
     processes=train_process,
+    teacher_process=val_process,
     repeat_factor=3,
 ),
 val=dict(
@@ -151,14 +155,3 @@ seg_weight = [0.4, 1.0, 1.0, 1.0]
 ignore_label = 255
 # bg_weight = 0.4
 lr_update_by_epoch = False
-
-teacher_process = [
-    dict(type='GenerateLaneLine',
-         transforms=[
-             dict(name='Resize',
-                  parameters=dict(size=dict(height=img_h, width=img_w)),
-                  p=1.0),
-         ],
-    ),
-    dict(type='ToTensor', keys=['img', 'lane_line', 'seg']),
-]

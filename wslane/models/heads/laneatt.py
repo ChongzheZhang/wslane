@@ -12,6 +12,7 @@ from wslane.utils.lane import Lane
 from wslane.models.losses.focal_loss import FocalLoss
 
 from wslane.models.utils.seg_decoder import SegDecoder
+from wslane.models.utils.num_branch import NumBranch
 
 from ..registry import HEADS
 
@@ -47,7 +48,7 @@ class LaneATT(nn.Module):
         self.ws_learn = self.cfg.ws_learn if 'ws_learn' in cfg else False
         self.tri_loss = self.cfg.tri_loss if 'tri_loss' in cfg else False
         self.det_to_seg = self.cfg.det_to_seg if 'det_to_seg' in cfg else False
-        self.seg_distribution_to_num = self.cfg.seg_distribution_to_num if 'seg_distribution_to_num' in cfg else False
+        self.seg_distribution = self.cfg.seg_distribution if 'seg_distribution' in cfg else False
         self.pycda = self.cfg.pycda if 'pycda' in cfg else False
 
         # Anchor angles, same ones used in Line-CNN
@@ -80,21 +81,12 @@ class LaneATT(nn.Module):
         self.initialize_layer(self.cls_layer)
         self.initialize_layer(self.reg_layer)
         if self.tri_loss:
-            self.tri_layer = nn.Linear(self.anchor_feat_channels * self.fmap_h, 16)
+            self.tri_layer = nn.Linear(self.anchor_feat_channels * self.fmap_h, 12)
             self.initialize_layer(self.tri_layer)
         if self.num_branch:
-            self.nlane = self.cfg.pseudo_label_parameters.nlane + 1
-            inter_channels = backbone_nb_channels // 4
-            self.num_branch_layers = nn.Sequential(
-                nn.Conv2d(backbone_nb_channels, inter_channels, 3, padding=1, bias=False),
-                nn.BatchNorm2d(inter_channels),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Conv2d(inter_channels, self.nlane, 1),
-            )
-            for layer in self.num_branch_layers:
-                self.initialize_layer(layer)
-        if self.seg_distribution_to_num:
+            nlane = self.cfg.pseudo_label_parameters.nlane + 1
+            self.NumBranch = NumBranch(nlane, backbone_nb_channels)
+        if self.seg_distribution:
             previous_seg_label_ave = nn.Parameter(torch.zeros(1, 3, dtype=torch.float32), requires_grad=False)
             self.register_parameter(name='previous_seg_label_ave', param=previous_seg_label_ave)
             previous_number_of_lane_sum = nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
@@ -121,8 +113,13 @@ class LaneATT(nn.Module):
     def forward(self, x, **kwargs):
         if self.training:
             self.is_target = kwargs['batch']['is_target'] if 'is_target' in kwargs['batch'] else False
+            self.is_student = kwargs['batch']['teacher_student'] if 'teacher_student' in kwargs['batch'] else False
         else:
             self.is_target = True
+            self.is_student = True
+        self.num_branch_trigger = self.num_branch and self.is_target and self.is_student
+        self.tri_loss_trigger = self.tri_loss and self.is_target
+        self.seg_distribution_trigger = self.seg_distribution and self.is_target and self.is_student
         output = {}
         param = self.cfg.train_parameters if self.training else self.cfg.test_parameters
         conf_threshold = param.conf_threshold
@@ -133,9 +130,8 @@ class LaneATT(nn.Module):
         x = x[-1]
         batch_features = self.conv1(x)
         batch_anchor_features = self.cut_anchor_features(batch_features)
-        if self.num_branch and self.is_target:
-            batch_num_lane = self.num_forward(x)
-            output['batch_num_lane'] = batch_num_lane
+        if self.num_branch_trigger:
+            output['batch_num_lane'] = self.NumBranch(x)
 
         if self.seg_branch:
             pyramid_features[0] = self.seg_conv1(pyramid_features[0])
@@ -158,7 +154,7 @@ class LaneATT(nn.Module):
                 output['seg_pool_1'] = seg_pool_1
                 output['seg_pool_2'] = seg_pool_2
 
-            if self.seg_distribution_to_num and self.is_target:
+            if self.seg_distribution_trigger:
                 seg_scores = F.softmax(seg, dim=1)
                 part_seg_scores = F.softmax(seg, dim=1)[:, :3, :, :]
                 label = torch.max(part_seg_scores, dim=1)[1]
@@ -228,25 +224,10 @@ class LaneATT(nn.Module):
 
         output['proposals_list'] = proposals_list
 
-
-        if self.training:
-            if self.ws_learn and self.is_target:
-                batch_anchor_features_tri = None
-                if self.tri_loss:
-                    batch_anchor_features_tri = self.tri_layer(batch_anchor_features)
-                    batch_anchor_features_tri = batch_anchor_features_tri.reshape(x.shape[0], len(self.anchors), -1)
-                meta_batch = self.generate_pseudo_label(output, kwargs['batch'], batch_anchor_features_tri)
-            else:
-                meta_batch = kwargs['batch']
-            loss_dic = {}
-            return self.loss(output, meta_batch, loss_dic)
-        else:
-            return output
-
-    def num_forward(self, x):
-        output_ = self.num_branch_layers(x)
-        mpl = nn.MaxPool2d(output_.shape[2:])
-        output = mpl(output_).view(-1, self.nlane)
+        if self.tri_loss_trigger:
+            batch_anchor_features_tri = self.tri_layer(batch_anchor_features)
+            batch_anchor_features_tri = batch_anchor_features_tri.reshape(x.shape[0], len(self.anchors), -1)
+            output['anchor_features'] = batch_anchor_features_tri
 
         return output
 
@@ -341,12 +322,15 @@ class LaneATT(nn.Module):
 
         return positives, invalid_offsets_mask[:, :-1], negatives, target_positives_indices
 
-    def loss(self, output, meta_batch, loss_dic):
+    def loss(self, output, meta_batch):
+        loss_dic = {}
         loss_dic = self.detection_branch_loss(output, meta_batch, loss_dic)
         if self.seg_branch:
             loss_dic = self.seg_branch_loss(output, meta_batch, loss_dic)
         if self.num_branch and self.is_target:
-            loss_dic = self.num_branch_loss(output, meta_batch, loss_dic)
+            num_branch_loss_weight = self.cfg.num_branch_loss_weight if 'num_branch_loss_weight' in self.cfg else 1.0
+            num_branch_loss = self.NumBranch.loss(output['batch_num_lane'], meta_batch['number'], num_branch_loss_weight)
+            loss_dic = self.updata_loss_dic(num_branch_loss, 'num_branch_loss', loss_dic)
 
         return loss_dic
 
@@ -367,10 +351,8 @@ class LaneATT(nn.Module):
         proposals_list = output['proposals_list']
         focal_loss = FocalLoss(alpha=0.25, gamma=2.)
         smooth_l1_loss = nn.SmoothL1Loss()
-        triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
         cls_loss = 0
         reg_loss = 0
-        tri_loss = 0
         valid_imgs = len(targets)
         total_positives = 0
         for (proposals, anchors, _, _), target in zip(proposals_list, targets):
@@ -433,34 +415,6 @@ class LaneATT(nn.Module):
             reg_loss += smooth_l1_loss(reg_pred, reg_target)
             cls_loss += focal_loss(cls_pred, cls_target).sum() / num_positives
 
-        # triplet loss
-        if self.tri_loss and self.is_target:
-            non_zero_counter = 0
-            tri_loss_weight = self.cfg.tri_loss_weight if self.cfg.haskey('tri_loss_weight') else 1.0
-            for positive_target, negative_target in zip(meta_batch['positive_target'], meta_batch['negative_target']):
-                device = positive_target.device
-                positive_len = positive_target.shape[0]
-                negative_len = negative_target.shape[0]
-                tri_sample_len = min(positive_len, negative_len)
-                positive_target = positive_target[:tri_sample_len, :]
-                negative_target = negative_target[:tri_sample_len, :]
-                if tri_sample_len != 0:
-                    non_zero_counter += 1
-                    if tri_sample_len <= 2:
-                        tri_anchor = positive_target.clone()
-                        positive_target = positive_target.flip(dims=[0])
-                    else:
-                        tri_anchor = positive_target.repeat_interleave(tri_sample_len-1, dim=0)
-                        positive_target = positive_target.repeat(tri_sample_len, 1)
-                        masked_number = torch.arange(tri_sample_len, dtype=torch.long, device=device) * (tri_sample_len + 1)
-                        mask = torch.ones(positive_target.shape[0], dtype=torch.bool, device=device)
-                        mask[masked_number] = False
-                        positive_target = positive_target[mask]
-                        negative_target = negative_target[:tri_sample_len-1, ...].repeat(tri_sample_len, 1)
-                    tri_loss += triplet_loss(tri_anchor, positive_target, negative_target) * tri_loss_weight
-            tri_loss /= (non_zero_counter + 1e-3)
-
-
         # Batch mean
         cls_loss /= valid_imgs
         reg_loss /= valid_imgs
@@ -468,13 +422,13 @@ class LaneATT(nn.Module):
         if 'average_pseudo_number_of_lane' in meta_batch:
             loss_dic['loss_stats']['ave_pseudo_lane'] = meta_batch['average_pseudo_number_of_lane']
 
-        loss = cls_loss_weight * cls_loss + reg_loss_weight * reg_loss + tri_loss
+        loss = cls_loss_weight * cls_loss + reg_loss_weight * reg_loss
         loss_dic['loss'] = loss
         loss_dic['loss_stats']['loss'] = loss_dic['loss']
         loss_dic['loss_stats']['cls_loss'] = cls_loss_weight * cls_loss
         loss_dic['loss_stats']['reg_loss'] = reg_loss_weight * reg_loss
-        if tri_loss:
-            loss_dic['loss_stats']['tri_loss'] = tri_loss
+        if self.tri_loss and self.is_target:
+            loss_dic = self.triplet_loss(meta_batch, loss_dic)
         loss_dic['loss_stats']['batch_positives'] = total_positives
 
         if 'positive_pseudo_label_len' in meta_batch:
@@ -482,32 +436,14 @@ class LaneATT(nn.Module):
             number_gt = meta_batch['number'].view(-1, 1)
             mse_loss = nn.MSELoss()
             number_lane_loss = mse_loss(positive_pseudo_label_len, number_gt.to(dtype=torch.float32)) * num_lane_loss_weight
-
-            loss_dic['loss'] += number_lane_loss
-            loss_dic['loss_stats']['loss'] = loss_dic['loss']
-            loss_dic['loss_stats']['number_lane_loss'] = number_lane_loss
-
-        return loss_dic
-
-    def num_branch_loss(self, output, meta_batch, loss_dic):
-        targets = meta_batch['number']
-        predictions = output['batch_num_lane']
-        ce_loss = nn.CrossEntropyLoss()
-        num_branch_loss = ce_loss(predictions, targets)
-        loss_dic['loss'] += num_branch_loss
-        loss_dic['loss_stats']['loss'] = loss_dic['loss']
-        loss_dic['loss_stats']['num_branch_loss'] = num_branch_loss
+            loss_dic = self.updata_loss_dic(number_lane_loss, 'number_lane_loss', loss_dic)
 
         return loss_dic
 
     def seg_branch_loss(self, output, meta_batch, loss_dic):
         seg_loss_weight = self.cfg.seg_loss_weight if self.cfg.haskey('seg_loss_weight') else 1.0
         targets = meta_batch['seg']
-        # predictions = output['seg']
-        # ce_loss = nn.CrossEntropyLoss(weight=torch.tensor([0.5, 1.0, 1.5, 2.0]).to(device=predictions.device))
-        # seg_loss = ce_loss(predictions, targets) * seg_loss_weight
 
-        # nllloss version
         predictions = F.log_softmax(output['seg'], dim=1)
         weights = torch.FloatTensor(self.cfg.seg_weight).to(device=predictions.device)
         nllloss = nn.NLLLoss(weight=weights)
@@ -524,17 +460,12 @@ class LaneATT(nn.Module):
             loss_dic = self.updata_loss_dic(seg_pool_1_loss, 'seg_pool_1_loss', loss_dic)
             loss_dic = self.updata_loss_dic(seg_pool_2_loss, 'seg_pool_2_loss', loss_dic)
 
-        if self.seg_distribution_to_num and self.is_target:
+        if self.seg_distribution and self.is_target:
             seg_dist_weight = self.cfg.seg_dist_weight if 'seg_dist_weight' in self.cfg else 1.0
             batch_size = meta_batch['number'].shape[0]
             smooth_l1_loss = nn.SmoothL1Loss()
             current_num_sum = torch.sum(meta_batch['number'])
             current_seg_label_sum = output['current_seg_label_sum']
-            seg_label_sum_target = self.previous_seg_label_ave.repeat(batch_size, 1)
-            for i, number in enumerate(meta_batch['number']):
-                seg_label_sum_target[i, :] *= number
-            seg_distribution_loss = smooth_l1_loss(current_seg_label_sum, seg_label_sum_target) * seg_dist_weight
-            loss_dic = self.updata_loss_dic(seg_distribution_loss, 'seg_distribution_loss', loss_dic)
 
             current_seg_label_batch_sum = torch.sum(current_seg_label_sum, dim=0, keepdim=True)
             previous_seg_label_ave = nn.Parameter((self.previous_seg_label_ave * self.previous_number_of_lane_sum + current_seg_label_batch_sum.detach()) / (
@@ -543,7 +474,61 @@ class LaneATT(nn.Module):
             self.previous_seg_label_ave = previous_seg_label_ave
             self.previous_number_of_lane_sum += current_num_sum
 
+            seg_label_sum_target = self.previous_seg_label_ave.repeat(batch_size, 1)
+            for i, number in enumerate(meta_batch['number']):
+                seg_label_sum_target[i, :] *= number
+            seg_distribution_loss = smooth_l1_loss(current_seg_label_sum, seg_label_sum_target) * seg_dist_weight
+            loss_dic = self.updata_loss_dic(seg_distribution_loss, 'seg_distribution_loss', loss_dic)
+
         return loss_dic
+
+    def triplet_loss(self, batch, loss_dic):
+        tri_loss = 0
+        non_zero_counter = 0
+        triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
+        tri_loss_weight = self.cfg.tri_loss_weight if self.cfg.haskey('tri_loss_weight') else 1.0
+        positive_targets = batch['positive_target']
+        negative_targets = batch['negative_target']
+        anchors = batch['anchor'] if 'anchor' in batch else None
+        device = negative_targets[0].device
+        if anchors is not None:
+            for anchor, positive_target, negative_target in zip(anchors, positive_targets, negative_targets):
+                anchor_len = anchor.shape[0]
+                positive_len = positive_target.shape[0]
+                negative_len = negative_target.shape[0]
+                tri_sample_len = min(anchor_len, positive_len, negative_len)
+                anchor = anchor[:tri_sample_len, :]
+                positive_target = positive_target[:tri_sample_len, :]
+                negative_target = negative_target[:tri_sample_len, :]
+                if tri_sample_len != 0:
+                    non_zero_counter += 1
+                    tri_loss += triplet_loss(anchor, positive_target, negative_target) * tri_loss_weight
+        else:
+            for positive_target, negative_target in zip(positive_targets, negative_targets):
+                positive_len = positive_target.shape[0]
+                negative_len = negative_target.shape[0]
+                tri_sample_len = min(positive_len, negative_len)
+                positive_target = positive_target[:tri_sample_len, :]
+                negative_target = negative_target[:tri_sample_len, :]
+                if tri_sample_len != 0:
+                    non_zero_counter += 1
+                    if tri_sample_len <= 2:
+                        tri_anchor = positive_target.clone()
+                        positive_target = positive_target.flip(dims=[0])
+                    else:
+                        tri_anchor = positive_target.repeat_interleave(tri_sample_len - 1, dim=0)
+                        positive_target = positive_target.repeat(tri_sample_len, 1)
+                        masked_number = torch.arange(tri_sample_len, dtype=torch.long, device=device) * (tri_sample_len + 1)
+                        mask = torch.ones(positive_target.shape[0], dtype=torch.bool, device=device)
+                        mask[masked_number] = False
+                        positive_target = positive_target[mask]
+                        negative_target = negative_target[:tri_sample_len - 1, ...].repeat(tri_sample_len, 1)
+                    tri_loss += triplet_loss(tri_anchor, positive_target, negative_target) * tri_loss_weight
+        tri_loss /= (non_zero_counter + 1e-3)
+        loss_dic = self.updata_loss_dic(tri_loss, 'tri_loss', loss_dic)
+
+        return loss_dic
+
 
     def updata_loss_dic(self, loss, loss_name, loss_dic):
         loss_dic['loss'] += loss
@@ -551,14 +536,13 @@ class LaneATT(nn.Module):
         loss_dic['loss_stats'][f'{loss_name}'] = loss
         return loss_dic
 
-    def generate_pseudo_label(self, prediction_batch, meta_batch, batch_anchor_features_tri=None):
+    def generate_pseudo_label(self, prediction_batch, meta_batch):
         softmax = nn.Softmax(dim=1)
         param = self.cfg.pseudo_label_parameters
         conf_threshold = param.conf_threshold
         nms_thres = param.nms_thres
         max_lanes = param.max_lanes
         predictions = prediction_batch['proposals_list']
-        # segmentations = nn.functional.interpolate(prediction_batch['seg'], size=(self.img_h, self.img_w), mode='bilinear', align_corners=False)
         segmentations = prediction_batch['seg']
         positive_coordinate_batch = []
 
@@ -573,17 +557,18 @@ class LaneATT(nn.Module):
         pseudo_number_of_lane = 0
         meta_batch['negative_target'] = []
         meta_batch['positive_target'] = []
-        for i, ((proposals, _, _, anchor_feature_idx), segmentation) in enumerate(zip(predictions, segmentations)):
+        for i, (proposals, _, _, anchor_feature_idx) in enumerate(predictions):
             if self.tri_loss or self.det_to_seg:
                 if not self.seg_branch:
                     raise ValueError("Triplet Loss or Detection Results to Segmetation Label must have Segmentation branch")
 
                 new_proposals = proposals[:40, :].clone()
                 new_anchor_feature_idx = anchor_feature_idx[:40].clone()
+                segmentation = segmentations[i, ...]
                 new_scores = self.score_rectified_by_seg(new_proposals, segmentation)
 
                 if self.tri_loss:
-                    anchor_features_tri = batch_anchor_features_tri[i, ...]
+                    anchor_features_tri = prediction_batch['anchor_features'][i, ...]
                     _, negative_indices = torch.sort(new_scores)
                     negative_indices = negative_indices[:20]
                     new_anchor_feature_idx = new_anchor_feature_idx[negative_indices]
@@ -680,6 +665,181 @@ class LaneATT(nn.Module):
                     meta_batch['seg_pool_1_label'] = seg_pred_to_label(seg_pool_1)
                     meta_batch['seg_pool_2_label'] = seg_pred_to_label(seg_pool_2)
 
+        return meta_batch
+
+    def teacher_pseudo_label(self, prediction_batch, meta_batch):
+        softmax = nn.Softmax(dim=1)
+        param = self.cfg.pseudo_label_parameters
+        conf_threshold = param.conf_threshold
+        nms_thres = param.nms_thres
+        max_lanes = param.max_lanes
+        predictions = prediction_batch['proposals_list']
+        segmentations = prediction_batch['seg']
+        # numbers = meta_batch['number'] == 0
+        positive_coordinate_batch = []
+
+        anchor_len = predictions[0][0].shape[1]
+        device = meta_batch['img'].device
+        batch_size = meta_batch['img'].shape[0]
+        pseudo_label = torch.ones((batch_size, max_lanes, anchor_len), dtype=torch.float32, device=device) * -1e5
+        pseudo_label[:, :, 0] = 1
+        pseudo_label[:, :, 1] = 0
+        max_lane = 0
+        pseudo_number_of_lane = 0
+        meta_batch['positive_target'] = []
+        for i, (proposals, _, _, anchor_feature_idx) in enumerate(predictions):
+            if self.tri_loss or self.det_to_seg:
+                if not self.seg_branch:
+                    raise ValueError("Triplet Loss or Detection Results to Segmetation Label must have Segmentation branch")
+
+                new_proposals = proposals[:40, :].clone()
+                segmentation = segmentations[i, ...]
+                new_scores = self.score_rectified_by_seg(new_proposals, segmentation)
+
+                if self.tri_loss:
+                    anchor_features_tri = prediction_batch['anchor_features'][i, ...]
+                    _, negative_indices = torch.sort(new_scores)
+                    negative_indices = negative_indices[:20]
+
+                if self.det_to_seg:
+                    with torch.no_grad():
+                        positive_proposals = new_proposals[new_scores > self.cfg.rectify_parameters.upper_thr]
+                        number_lane_gt = meta_batch['number'][i]
+                        if positive_proposals.shape[0] > number_lane_gt:
+                            positive_proposals = positive_proposals[:number_lane_gt, :]
+                        positive_coordinate = []
+                        if positive_proposals.shape[0] != 0:
+                            positive_coordinate = self.get_anchor_coordinate(positive_proposals)
+                        positive_coordinate_batch.append(positive_coordinate)
+
+            with torch.no_grad():
+                lane_num_to_keep = torch.arange(proposals.shape[0], dtype=torch.int64, device=device)
+                scores = softmax(proposals[:, :2])[:, 1]
+                mask = scores > conf_threshold
+                proposals = proposals[mask]
+                lane_num_to_keep = lane_num_to_keep[mask]
+
+                pre_length = proposals[:, 2] * self.n_strips + proposals[:, 4]
+                valid_length = pre_length < self.n_strips
+                proposals = proposals[valid_length]
+                lane_num_to_keep = lane_num_to_keep[valid_length]
+
+                if proposals.shape[0] > 0:
+                    scores = softmax(proposals[:, :2])[:, 1]
+                    keep, num_to_keep, _ = nms(proposals, scores, overlap=nms_thres, top_k=max_lanes)
+                    keep = keep[:num_to_keep]
+                    proposals = proposals[keep]
+                    lane_num_to_keep = lane_num_to_keep[keep]
+                    proposals[:, 0] = 0
+                    proposals[:, 1] = 1
+                    proposals[:, 2:4] = torch.clamp(proposals[:, 2:4], min=0, max=1)
+                    proposals[:, 3] = proposals[:, 3] * self.img_w
+                    proposals[:, 4] = torch.round(proposals[:, 4])
+                    all_lane_length = torch.round(proposals[:, 2] * self.n_strips) + proposals[:, 4]
+                    for k, lane_length in enumerate(all_lane_length.to(torch.int)):
+                        proposals[k, 5 + lane_length.item():] = -1e5
+
+                    these_lanes = min(proposals.shape[0], max_lanes)
+                    pseudo_label[i, :these_lanes, :] = proposals[:these_lanes, :]
+                    pseudo_number_of_lane += these_lanes
+                    if these_lanes > max_lane:
+                        max_lane = these_lanes
+
+                if self.tri_loss:
+                    not_equal_mask = torch.all(lane_num_to_keep.unsqueeze(1) != negative_indices.unsqueeze(0), dim=1)
+                    lane_num_to_keep_in_tri = lane_num_to_keep[not_equal_mask]
+                    positive_anchor_features_idx = anchor_feature_idx[lane_num_to_keep_in_tri]
+                    positive_anchor_features = anchor_features_tri[positive_anchor_features_idx]
+                    meta_batch['positive_target'].append(positive_anchor_features)
+
+        pseudo_number_of_lane /= batch_size
+        max_lane = max(max_lane, 4)
+        pseudo_label = pseudo_label[:, :max_lane, :]
+
+        meta_batch['lane_line'] = pseudo_label
+        meta_batch['average_pseudo_number_of_lane'] = pseudo_number_of_lane
+
+        if self.seg_branch:
+            def seg_pred_to_label(preds):
+                softmax = nn.Softmax(dim=1)
+                all_seg_scores = softmax(preds)
+                part_seg_scores = softmax(preds[:, :3, :, :])
+                label = torch.max(part_seg_scores, dim=1)[1]
+                label[all_seg_scores[:, 3, :, :]>0.5] = 3
+                return label
+
+            seg_preds = prediction_batch['seg']
+            with torch.no_grad():
+                pseudo_seg_label = seg_pred_to_label(seg_preds)
+                # pseudo_seg_label[numbers, ...] = 0
+                if self.det_to_seg:
+                    seg_label_from_detection = self.expand_coordinate(positive_coordinate_batch, 15, 15).to(device=device)
+                    nonzero_mask = seg_label_from_detection > 0
+                    pseudo_seg_label[nonzero_mask] = seg_label_from_detection[nonzero_mask]
+                    pseudo_seg_label = self.surrounding_restric(pseudo_seg_label)
+                meta_batch['seg'] = pseudo_seg_label
+
+        return meta_batch
+
+    def student_pseudo_label(self, prediction_batch, meta_batch):
+        softmax = nn.Softmax(dim=1)
+        param = self.cfg.pseudo_label_parameters
+        conf_threshold = param.conf_threshold
+        nms_thres = param.nms_thres
+        max_lanes = param.max_lanes
+        predictions = prediction_batch['proposals_list']
+        segmentations = prediction_batch['seg']
+        device = meta_batch['img'].device
+        batch_size = meta_batch['img'].shape[0]
+        positive_pseudo_label_len = torch.zeros((batch_size, 1), device=device)
+        meta_batch['negative_target'] = []
+        meta_batch['anchor'] = []
+        for i, (proposals, _, _, anchor_feature_idx) in enumerate(predictions):
+            if self.tri_loss:
+                if not self.seg_branch:
+                    raise ValueError("Triplet Loss or Detection Results to Segmetation Label must have Segmentation branch")
+                new_proposals = proposals[:40, :].clone()
+                new_anchor_feature_idx = anchor_feature_idx[:40].clone()
+                segmentation = segmentations[i, ...]
+                new_scores = self.score_rectified_by_seg(new_proposals, segmentation)
+                anchor_features_tri = prediction_batch['anchor_features'][i, ...]
+                _, negative_indices = torch.sort(new_scores)
+                negative_indices = negative_indices[:20]
+                new_anchor_feature_idx = new_anchor_feature_idx[negative_indices]
+                negative_anchor_features = anchor_features_tri[new_anchor_feature_idx]
+                meta_batch['negative_target'].append(negative_anchor_features)
+
+            with torch.no_grad():
+                lane_num_to_keep = torch.arange(proposals.shape[0], dtype=torch.int64, device=device)
+                scores = softmax(proposals[:, :2])[:, 1]
+                mask = scores > conf_threshold
+                proposals = proposals[mask]
+                lane_num_to_keep = lane_num_to_keep[mask]
+
+                pre_length = proposals[:, 2] * self.n_strips + proposals[:, 4]
+                valid_length = pre_length < self.n_strips
+                proposals = proposals[valid_length]
+                lane_num_to_keep = lane_num_to_keep[valid_length]
+
+                if proposals.shape[0] > 0:
+                    scores = softmax(proposals[:, :2])[:, 1]
+                    keep, num_to_keep, _ = nms(proposals, scores, overlap=nms_thres, top_k=max_lanes)
+                    keep = keep[:num_to_keep]
+                    lane_num_to_keep = lane_num_to_keep[keep]
+
+            lane_num_proposals = predictions[i][0][lane_num_to_keep, :2]
+            if lane_num_proposals.shape[0] > 0:
+                num_scores = softmax(lane_num_proposals)[:, 1]
+                positive_pseudo_label_len[i, 0] = num_scores.sum()
+            if self.tri_loss:
+                not_equal_mask = torch.all(lane_num_to_keep.unsqueeze(1) != negative_indices.unsqueeze(0), dim=1)
+                lane_num_to_keep_in_tri = lane_num_to_keep[not_equal_mask]
+                positive_anchor_features_idx = anchor_feature_idx[lane_num_to_keep_in_tri]
+                positive_anchor_features = anchor_features_tri[positive_anchor_features_idx]
+                meta_batch['anchor'].append(positive_anchor_features)
+
+        meta_batch['positive_pseudo_label_len'] = positive_pseudo_label_len
+        meta_batch['average_pseudo_number_of_lane'] = torch.tensor(meta_batch['average_pseudo_number_of_lane'])
 
         return meta_batch
 

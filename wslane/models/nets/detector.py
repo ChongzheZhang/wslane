@@ -14,6 +14,7 @@ class Detector(nn.Module):
         self.aggregator = build_aggregator(cfg) if cfg.haskey('aggregator') else None
         self.neck = build_necks(cfg) if cfg.haskey('neck') else None
         self.heads = build_heads(cfg)
+        self.ws_learn = self.cfg.ws_learn if 'ws_learn' in cfg else False
     
     def get_lanes(self, output):
         return self.heads.get_lanes(output)
@@ -48,7 +49,8 @@ class Detector(nn.Module):
 
 
     def forward(self, batch):
-        output = {}
+        is_target = batch['is_target'] if 'is_target' in batch else False
+        student_process = batch['teacher_student'] if 'teacher_student' in batch else False
         fea = self.backbone(batch['img'] if isinstance(batch, dict) else batch)
 
         if self.aggregator:
@@ -58,8 +60,28 @@ class Detector(nn.Module):
             fea = self.neck(fea)
 
         if self.training:
-            output = self.heads(fea, batch=batch)
+            out = self.heads(fea, batch=batch)
+            if self.ws_learn and is_target:
+                if student_process:
+                    batch = self.heads.student_pseudo_label(out, batch)
+                else:
+                    batch = self.heads.generate_pseudo_label(out, batch)
+            output = self.heads.loss(out, batch)
         else:
             output = self.heads(fea)
 
         return output
+
+    def teacher_forward(self, batch):
+        fea = self.backbone(batch['img'] if isinstance(batch, dict) else batch)
+
+        if self.aggregator:
+            fea[-1] = self.aggregator(fea[-1])
+
+        if self.neck:
+            fea = self.neck(fea)
+
+        out = self.heads(fea, batch=batch)
+        meta_batch = self.heads.teacher_pseudo_label(out, batch)
+
+        return meta_batch

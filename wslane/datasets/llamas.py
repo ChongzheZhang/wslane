@@ -17,10 +17,10 @@ import wslane.utils.llamas_metric as llamas_metric
 
 @DATASETS.register_module
 class LLAMAS(BaseDataset):
-    def __init__(self, data_root, split='train', processes=None, cfg=None):
+    def __init__(self, data_root, split='train', processes=None, teacher_process=None, cfg=None):
         self.split = split
         self.data_root = data_root
-        super().__init__(data_root, split, processes, cfg)
+        super().__init__(data_root, split, processes, teacher_process, cfg)
         if split != 'test' and split not in SPLIT_DIRECTORIES.keys():
             raise Exception('Split `{}` does not exist.'.format(split))
         if split != 'test':

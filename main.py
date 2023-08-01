@@ -30,6 +30,24 @@ def main():
     cfg.seed = args.seed
     cfg.no_comet = args.no_comet
 
+    # cfg.cls_loss_weight = args.cls_loss_weight
+    # if 'xyt_loss_weight' in cfg:
+    #     cfg.xyt_loss_weight = args.xyt_loss_weight
+    # cfg.num_lane_loss_weight = args.num_lane_loss_weight
+    # if 'tri_loss_weight' in cfg:
+    #     cfg.tri_loss_weight = args.tri_loss_weight
+    # cfg.iou_loss_weight = args.iou_loss_weight
+    # cfg.seg_loss_weight = args.seg_loss_weight
+    # if isinstance(cfg.reg_loss_weight, list):
+    #     cfg.reg_loss_weight[0] = args.regW0
+    #     cfg.reg_loss_weight[1] = args.regW1
+    #     cfg.reg_loss_weight[2] = args.regW2
+    # else:
+    #     cfg.reg_loss_weight = args.reg_loss_weight
+    cfg.optimizer.lr = args.lr
+
+    cfg.ema_rate = args.ema_rate
+
     # cfg.work_dirs = args.work_dirs if args.work_dirs else cfg.work_dirs
     cfg.work_dirs = os.path.join('./outputs', args.work_dirs)
 
@@ -63,6 +81,19 @@ def parse_args():
     parser.add_argument('--gpus', type=int, default='1')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--no_comet', action='store_true', help='disable comet')
+
+    # parser.add_argument('--reg_loss_weight', type=float, default=1.0, help='reg_loss_weight')
+    # parser.add_argument('--cls_loss_weight', type=float, default=2.0, help='cls_loss_weight')
+    # parser.add_argument('--xyt_loss_weight', type=float, default=0.1, help='clrnet xyt_loss_weight')
+    # parser.add_argument('--seg_loss_weight', type=float, default=1.0, help='seg_loss_weight')
+    # parser.add_argument('--num_lane_loss_weight', type=float, default=1.0, help='num_lane_loss_weight')
+    # parser.add_argument('--tri_loss_weight', type=float, default=1.0, help='tri_loss_weight')
+    # parser.add_argument('--iou_loss_weight', type=float, default=3.0, help='clrnet iou_loss_weight')
+    # parser.add_argument('--regW0', type=float, default=2.0, help='clrnet reg_loss_weight 0')
+    # parser.add_argument('--regW1', type=float, default=1.0, help='clrnet reg_loss_weight 1')
+    # parser.add_argument('--regW2', type=float, default=0.5, help='clrnet reg_loss_weight 2')
+    parser.add_argument('--lr', type=float, default=4.0e-5, help='learning rate')
+    parser.add_argument('--ema_rate', type=float, default=0.99, help='ema update rate')
     args = parser.parse_args()
 
     return args

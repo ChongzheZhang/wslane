@@ -25,15 +25,17 @@ ws_combine_learn = True
 num_branch = False
 seg_branch = True
 tri_loss = True
-pycda = False
-seg_distribution_to_num = True
-det_to_seg = False
+seg_distribution = False
+kd_learn = True
+ema = True
+# pycda = False
+# det_to_seg = False
 
-cls_loss_weight = 1.0
-reg_loss_weight = 1.0
-num_lane_loss_weight = 1.0
-seg_loss_weight = 1.0
-tri_loss_weight = 1.0
+cls_loss_weight = 1.0 # fixed
+reg_loss_weight = 3.0 # fixed
+num_lane_loss_weight = 5.0 # fixed
+seg_loss_weight = 1.0 # fixed
+tri_loss_weight = 1.0 # fixed
 seg_dist_weight = 1.0
 
 train_parameters = dict(
@@ -42,14 +44,14 @@ train_parameters = dict(
     nms_topk=3000
 )
 test_parameters = dict(
-    conf_threshold=0.2,
+    conf_threshold=0.3,
     nms_thres=45,
     nms_topk=max_lanes
 )
 pseudo_label_parameters = dict(
     conf_threshold=0.5,
     nms_thres=45,
-    max_lanes=10,
+    max_lanes=max_lanes,
     nlane=4,
 )
 rectify_parameters = dict(
@@ -59,7 +61,7 @@ rectify_parameters = dict(
 
 optimizer = dict(
   type = 'AdamW',
-  lr = 1e-4,
+  lr = 5e-5,
 )
 
 epochs = 1
@@ -106,7 +108,7 @@ val_process = [
                   p=1.0),
          ],
          training=False),
-    dict(type='ToTensor', keys=['img', 'lane_line']),
+    dict(type='ToTensor', keys=['img']),
 ]
 
 dataset_path = './data/CULane'
@@ -119,6 +121,7 @@ dataset = dict(
         data_root=dataset_path,
         split='train',
         processes=train_process,
+        teacher_process=val_process,
     ),
     val=dict(
         type=dataset_type,
@@ -148,10 +151,9 @@ dataset = dict(
     )
 )
 
-
 workers = 12
 log_interval = 1
 seed=0
-lr_update_by_epoch = False
 num_classes = 4
-seg_weight = [0.5, 1.0, 1.5, 2.0]
+seg_weight = [0.5, 1.0, 1.0, 1.5]
+lr_update_by_epoch = False

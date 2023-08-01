@@ -39,6 +39,13 @@ class Runner(object):
         self.num_branch = self.cfg.num_branch if 'num_branch' in self.cfg else False
         self.seg_branch = self.cfg.seg_branch if 'seg_branch' in self.cfg else False
         self.ws_combine_learn = self.cfg.ws_combine_learn if 'ws_combine_learn' in self.cfg else False
+        self.teacher_process = self.cfg.kd_learn if 'kd_learn' in self.cfg else False
+        self.ema = self.cfg.ema if 'ema' in self.cfg else False
+        if self.teacher_process and self.ema:
+            self.teacher_net  = build_net(self.cfg)
+            self.teacher_net = MMDataParallel(self.teacher_net, device_ids=range(self.cfg.gpus)).cuda()
+            self.ema_rate = self.cfg.ema_rate if 'ema_rate' in self.cfg else 0.99
+            self.teacher_net = self.update_ema_variables(self.teacher_net, self.net, self.ema_rate, 0)
 
     def to_cuda(self, batch):
         for k in batch:
@@ -84,6 +91,8 @@ class Runner(object):
 
     def wslearn_epoch(self, epoch, train_loader, source_loader):
         self.net.train()
+        if self.teacher_process and self.ema:
+            self.teacher_net.train()
         end = time.time()
         assert len(train_loader) == len(source_loader)
         max_iter = len(train_loader)
@@ -111,11 +120,20 @@ class Runner(object):
             _, target_data = targetloader_iter.__next__()
             target_data.update({'is_target': True})
             target_data = self.to_cuda(target_data)
+            if self.teacher_process:
+                if self.ema:
+                    target_data = self.teacher_net.module.teacher_forward(target_data)
+                else:
+                    target_data = self.net.module.teacher_forward(target_data)
+                target_data = train_loader.dataset.re_process(target_data)
+                target_data.update({'teacher_student': True})
             output = self.net(target_data)
             self.optimizer.zero_grad()
             loss = output['loss'].sum()
             loss.backward()
             self.optimizer.step()
+            if self.ema:
+                self.teacher_net = self.update_ema_variables(self.teacher_net, self.net, self.ema_rate, i+1)
             if not self.cfg.lr_update_by_epoch:
                 self.scheduler.step()
             batch_time = time.time() - end
@@ -252,3 +270,9 @@ class Runner(object):
     def save_ckpt(self, is_best=False):
         save_model(self.net, self.optimizer, self.scheduler, self.recorder,
                    is_best)
+
+    def update_ema_variables(self, ema_model, model, alpha_teacher, iteration):
+        alpha_teacher = min(1 - 1 / (iteration + 1), alpha_teacher)
+        for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+            ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
+        return ema_model

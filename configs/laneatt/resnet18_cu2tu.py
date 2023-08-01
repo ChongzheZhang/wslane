@@ -25,15 +25,16 @@ ws_combine_learn = True
 num_branch = False
 seg_branch = True
 tri_loss = True
-pycda = False
-det_to_seg = False
-seg_distribution_to_num = False
+seg_distribution = False
+kd_learn = True
+# pycda = False
+# det_to_seg = False
 
-cls_loss_weight = 1.0
-reg_loss_weight = 1.0
-num_lane_loss_weight = 1.0
-seg_loss_weight = 1.0
-tri_loss_weight = 0.1
+cls_loss_weight = 3.0 # fixed
+reg_loss_weight = 0.5 # fixed
+num_lane_loss_weight = 1.0 # fixed
+seg_loss_weight = 1.0 # fixed
+tri_loss_weight = 1.0 # fixed
 seg_dist_weight = 0.1
 
 train_parameters = dict(
@@ -49,7 +50,7 @@ test_parameters = dict(
 pseudo_label_parameters = dict(
     conf_threshold=0.5,
     nms_thres=45,
-    max_lanes=10,
+    max_lanes=5,
     nlane=5,
 )
 rectify_parameters = dict(
@@ -58,13 +59,13 @@ rectify_parameters = dict(
 )
 
 optimizer = dict(
-  type = 'Adam',
-  lr = 4e-4,
+  type = 'AdamW',
+  lr = 1e-4,
 )
 
 epochs = 1
 batch_size = 40
-total_iter = (3268 * 5 // batch_size + 1) * epochs
+total_iter = (3268 * 3 // batch_size + 1) * epochs
 scheduler = dict(type = 'CosineAnnealingLR', T_max = total_iter)
 
 eval_from = 0 # must smaller than epochs
@@ -106,7 +107,7 @@ val_process = [
                   p=1.0),
          ],
          training=False),
-    dict(type='ToTensor', keys=['img', 'lane_line']),
+    dict(type='ToTensor', keys=['img']),
 ]
 
 dataset_path = './data/tusimple'
@@ -120,7 +121,8 @@ dataset = dict(
         data_root=dataset_path,
         split='train',
         processes=train_process,
-        repeat_factor=5,
+        teacher_process=val_process,
+        repeat_factor=3,
     ),
     val=dict(
         type=dataset_type,
@@ -145,7 +147,7 @@ dataset = dict(
         data_root=source_dataset_path,
         split='train',
         processes=train_process,
-        data_size=3268 * 5,
+        data_size=3268 * 3,
     )
 )
 
